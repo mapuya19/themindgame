@@ -1,22 +1,31 @@
 'use client';
 
-import { useState, useEffect } from 'react';
-import { useRouter } from 'next/navigation';
+import { useState, Suspense } from 'react';
+import { useRouter, useSearchParams } from 'next/navigation';
 import { motion, AnimatePresence } from 'framer-motion';
 
 const FLOATING_CARDS = [7, 23, 42, 56, 71, 88, 14, 35, 63, 91];
 
-export default function Home() {
+// Rotations randomised once at module level. The server and client will
+// compute different values, but we use suppressHydrationWarning on the
+// motion.div to tell React not to patch up the transform mismatch — these
+// are purely decorative background elements.
+const CARD_ROTATIONS = FLOATING_CARDS.map(() => ({
+  initial: Math.random() * 30 - 15,
+  animate: Math.random() * 60 - 30,
+  duration: 15 + Math.random() * 10,
+}));
+
+function HomeInner() {
   const router = useRouter();
-  const [playerName, setPlayerName] = useState('');
-  const [showJoinForm, setShowJoinForm] = useState(false);
+  const searchParams = useSearchParams();
+  const [playerName, setPlayerName] = useState(() =>
+    typeof window !== 'undefined' ? localStorage.getItem('themind-player-name') || '' : ''
+  );
+  const [showJoinForm, setShowJoinForm] = useState(() => !!searchParams.get('error'));
   const [showRules, setShowRules] = useState(false);
   const [roomCodeInput, setRoomCodeInput] = useState('');
-
-  useEffect(() => {
-    const saved = localStorage.getItem('themind-player-name') || '';
-    if (saved) setPlayerName(saved);
-  }, []);
+  const [joinError, setJoinError] = useState(searchParams.get('error') || '');
 
   const handleCreateRoom = () => {
     if (!playerName.trim()) {
@@ -36,11 +45,11 @@ export default function Home() {
       return;
     }
     if (!roomCodeInput.trim() || roomCodeInput.trim().length !== 4) {
-      alert('Please enter a 4-letter room code');
+      setJoinError('Please enter a 4-letter room code');
       return;
     }
     localStorage.setItem('themind-player-name', playerName);
-    router.push(`/room/${roomCodeInput.toUpperCase()}`);
+    router.push(`/room/${roomCodeInput.toUpperCase()}?join=1`);
   };
 
   return (
@@ -50,18 +59,19 @@ export default function Home() {
         {FLOATING_CARDS.map((num, i) => (
           <motion.div
             key={num}
+            suppressHydrationWarning
             className="absolute w-12 h-16 rounded-lg bg-bg-card/30 border border-white/5 flex items-center justify-center text-white/10 text-sm font-bold"
             initial={{
               x: `${10 + (i * 9) % 80}vw`,
               y: '110vh',
-              rotate: Math.random() * 30 - 15,
+              rotate: CARD_ROTATIONS[i].initial,
             }}
             animate={{
               y: '-10vh',
-              rotate: Math.random() * 60 - 30,
+              rotate: CARD_ROTATIONS[i].animate,
             }}
             transition={{
-              duration: 15 + Math.random() * 10,
+              duration: CARD_ROTATIONS[i].duration,
               repeat: Infinity,
               delay: i * 2.5,
               ease: 'linear',
@@ -165,14 +175,17 @@ export default function Home() {
                   <div>
                     <label htmlFor="roomCode" className="block text-sm font-medium text-gray-300 mb-2 text-left">Room Code</label>
                     <input type="text" id="roomCode" value={roomCodeInput}
-                      onChange={(e) => setRoomCodeInput(e.target.value.toUpperCase())}
+                      onChange={(e) => { setRoomCodeInput(e.target.value.toUpperCase()); setJoinError(''); }}
                       onKeyDown={(e) => { if (e.key === 'Enter') handleJoinRoom(); }}
                       placeholder="ABCD" maxLength={4}
                       className="w-full px-4 py-3 bg-bg-primary/50 border border-white/10 rounded-lg text-white placeholder-gray-500 focus:outline-none focus:border-accent-star focus:ring-1 focus:ring-accent-star/30 transition-all text-center text-2xl font-bold tracking-widest uppercase"
                     />
+                    {joinError && (
+                      <p className="mt-2 text-sm text-red-400 text-center">{joinError}</p>
+                    )}
                   </div>
                   <button onClick={handleJoinRoom} className="w-full game-button-primary">Join</button>
-                  <button onClick={() => setShowJoinForm(false)} className="w-full game-button-secondary">Back</button>
+                  <button onClick={() => { setShowJoinForm(false); setJoinError(''); }} className="w-full game-button-secondary">Back</button>
                 </motion.div>
               )}
             </AnimatePresence>
@@ -186,7 +199,7 @@ export default function Home() {
           transition={{ duration: 0.5, delay: 0.5 }}
           className="mt-6"
         >
-          <button onClick={() => setShowRules(true)} className="text-sm text-gray-500 hover:text-accent-star transition-colors underline underline-offset-4 decoration-gray-700 hover:decoration-accent-star/50">
+          <button onClick={() => setShowRules(true)} className="text-sm text-gray-500 hover:text-accent-star transition-colors underline underline-offset-4 decoration-gray-700 hover:decoration-accent-star/50 min-h-[44px] px-3">
             How to Play
           </button>
         </motion.div>
@@ -205,14 +218,14 @@ export default function Home() {
       <AnimatePresence>
         {showRules && (
           <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
-            className="absolute inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm"
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm"
             onClick={() => setShowRules(false)}>
             <motion.div initial={{ opacity: 0, scale: 0.9, y: 20 }} animate={{ opacity: 1, scale: 1, y: 0 }} exit={{ opacity: 0, scale: 0.9, y: 20 }}
-              className="glass-card rounded-2xl p-6 max-w-lg mx-4 max-h-[80vh] overflow-y-auto"
+              className="glass-card rounded-2xl p-6 max-w-lg mx-4 max-h-[min(80vh,_calc(100dvh_-_4rem))] overflow-y-auto"
               onClick={e => e.stopPropagation()}>
               <div className="flex justify-between items-center mb-4">
                 <h2 className="text-2xl font-bold text-white">How to Play</h2>
-                <button onClick={() => setShowRules(false)} className="text-gray-400 hover:text-white text-xl">&times;</button>
+                <button onClick={() => setShowRules(false)} className="text-gray-400 hover:text-white w-11 h-11 flex items-center justify-center text-xl rounded-lg touch-manipulation">&times;</button>
               </div>
               <div className="space-y-4 text-sm text-gray-300">
                 <div>
@@ -252,5 +265,13 @@ export default function Home() {
         )}
       </AnimatePresence>
     </div>
+  );
+}
+
+export default function Home() {
+  return (
+    <Suspense>
+      <HomeInner />
+    </Suspense>
   );
 }

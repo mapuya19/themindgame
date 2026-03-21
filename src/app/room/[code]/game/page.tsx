@@ -112,6 +112,14 @@ export default function GamePage() {
     clientRef.current?.send({ type: 'restart_game' });
   };
 
+  const [copiedCode, setCopiedCode] = useState(false);
+
+  const handleCopyRoomCode = () => {
+    navigator.clipboard.writeText(roomCode);
+    setCopiedCode(true);
+    setTimeout(() => setCopiedCode(false), 2000);
+  };
+
   const isGameOver = status === 'game_over' || status === 'victory';
 
   if (!playerName) return null;
@@ -122,7 +130,7 @@ export default function GamePage() {
       <AnimatePresence>
         {!isConnected && (
           <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
-            className="absolute inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center">
+            className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center">
             <div className="text-center">
               <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-accent-star mx-auto mb-4" />
               <p className="text-white text-lg">Reconnecting...</p>
@@ -135,7 +143,7 @@ export default function GamePage() {
       <AnimatePresence>
         {showLevelComplete && (
           <motion.div initial={{ opacity: 0, scale: 0.8 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 0.8 }}
-            className="absolute inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm">
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm">
             <div className="glass-card rounded-2xl p-8 text-center">
               <h2 className="text-3xl font-bold text-accent-success mb-2">Level Complete!</h2>
               <p className="text-gray-300">Preparing Level {level + 1}...</p>
@@ -151,7 +159,7 @@ export default function GamePage() {
             initial={{ opacity: 0, y: -50 }}
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: -50 }}
-            className="absolute top-20 left-1/2 -translate-x-1/2 z-50"
+            className="fixed top-[calc(5rem+env(safe-area-inset-top,0px))] left-1/2 -translate-x-1/2 z-50 w-[calc(100vw-2rem)] max-w-sm px-1"
           >
             <div className="glass-card rounded-xl p-4 border border-red-500/40 bg-red-900/30 text-center max-w-sm">
               <p className="text-red-400 font-bold mb-1">Wrong Play!</p>
@@ -173,7 +181,7 @@ export default function GamePage() {
             initial={{ opacity: 0, y: -50 }}
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: -50 }}
-            className="absolute top-20 left-1/2 -translate-x-1/2 z-50"
+            className="fixed top-[calc(5rem+env(safe-area-inset-top,0px))] left-1/2 -translate-x-1/2 z-50 w-[calc(100vw-2rem)] max-w-sm px-1"
           >
             <div className="glass-card rounded-xl p-4 border border-yellow-500/40 bg-yellow-900/30 text-center max-w-sm">
               <p className="text-yellow-400 font-bold mb-1">Player Left</p>
@@ -187,7 +195,7 @@ export default function GamePage() {
       <AnimatePresence>
         {isGameOver && (
           <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
-            className="absolute inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm">
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm">
             <div className="glass-card rounded-2xl p-8 text-center max-w-md">
               {status === 'victory' ? (
                 <>
@@ -213,14 +221,14 @@ export default function GamePage() {
       <AnimatePresence>
         {showRules && (
           <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
-            className="absolute inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm"
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm"
             onClick={() => setShowRules(false)}>
             <motion.div initial={{ opacity: 0, scale: 0.9 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 0.9 }}
-              className="glass-card rounded-2xl p-6 max-w-lg mx-4 max-h-[80vh] overflow-y-auto"
+              className="glass-card rounded-2xl p-6 max-w-lg mx-4 max-h-[min(80vh,_calc(100dvh_-_4rem))] overflow-y-auto"
               onClick={e => e.stopPropagation()}>
               <div className="flex justify-between items-center mb-4">
                 <h2 className="text-2xl font-bold text-white">How to Play</h2>
-                <button onClick={() => setShowRules(false)} className="text-gray-400 hover:text-white text-xl">&times;</button>
+                <button onClick={() => setShowRules(false)} className="text-gray-400 hover:text-white w-11 h-11 flex items-center justify-center text-xl rounded-lg touch-manipulation">&times;</button>
               </div>
               <div className="space-y-4 text-sm text-gray-300">
                 <div>
@@ -288,7 +296,14 @@ export default function GamePage() {
             </div>
           </div>
           <div className="flex items-center gap-2">
-            <button onClick={() => setShowRules(true)} className="text-xs text-gray-400 hover:text-white transition-colors px-2 py-1 rounded border border-white/10 hover:border-white/30">
+            <button
+              onClick={handleCopyRoomCode}
+              className="text-xs font-bold tracking-widest text-accent-star px-2 py-1 rounded border border-accent-star/30 hover:border-accent-star/60 active:scale-95 transition-all touch-manipulation min-h-[44px] min-w-[44px]"
+              title="Copy room code"
+            >
+              {copiedCode ? '✓' : roomCode}
+            </button>
+            <button onClick={() => setShowRules(true)} className="text-xs text-gray-400 hover:text-white transition-colors min-h-[44px] min-w-[44px] px-3 py-2 rounded border border-white/10 hover:border-white/30 touch-manipulation">
               Rules
             </button>
             <div className={`w-3 h-3 rounded-full ${isConnected ? 'bg-green-400' : 'bg-yellow-400'}`} />
@@ -299,7 +314,7 @@ export default function GamePage() {
       {/* Center – Played cards + Discard pile */}
       <div className="flex-1 flex items-center justify-center gap-4 mb-4">
         {/* Played cards pile */}
-        <div className="glass-card rounded-2xl p-6 min-w-[200px] min-h-[180px] max-w-[450px] flex-1">
+        <div className="glass-card rounded-2xl p-4 sm:p-6 min-w-0 min-h-[140px] sm:min-h-[180px] flex-1">
           <p className="text-xs text-gray-400 uppercase tracking-wider mb-3 text-center">
             Played Cards ({playedCards.length})
           </p>
@@ -327,7 +342,7 @@ export default function GamePage() {
           <motion.div
             initial={{ opacity: 0, x: 20 }}
             animate={{ opacity: 1, x: 0 }}
-            className="glass-card rounded-2xl p-6 min-w-[150px] min-h-[180px] max-w-[250px] border border-red-500/20"
+            className="glass-card rounded-2xl p-4 sm:p-6 min-w-0 min-h-[140px] sm:min-h-[180px] max-w-[250px] border border-red-500/20"
           >
             <p className="text-xs text-red-400 uppercase tracking-wider mb-3 text-center">
               Discarded ({discardedCards.length})
@@ -405,18 +420,18 @@ export default function GamePage() {
               </p>
               <div className="flex gap-2">
                 <button onClick={() => handleShurikenVote(true)}
-                  className="flex-1 px-3 py-1.5 text-sm font-semibold rounded bg-accent-success/20 border border-accent-success/40 text-accent-success hover:bg-accent-success/30 transition-colors">
+                  className="flex-1 px-3 py-3 text-sm font-semibold rounded bg-accent-success/20 border border-accent-success/40 text-accent-success hover:bg-accent-success/30 active:bg-accent-success/40 transition-colors touch-manipulation min-h-[44px]">
                   Agree
                 </button>
                 <button onClick={() => handleShurikenVote(false)}
-                  className="flex-1 px-3 py-1.5 text-sm font-semibold rounded bg-red-500/20 border border-red-500/40 text-red-400 hover:bg-red-500/30 transition-colors">
+                  className="flex-1 px-3 py-3 text-sm font-semibold rounded bg-red-500/20 border border-red-500/40 text-red-400 hover:bg-red-500/30 active:bg-red-500/40 transition-colors touch-manipulation min-h-[44px]">
                   Decline
                 </button>
               </div>
             </motion.div>
           )}
 
-          <button onClick={handleLeaveRoom} className="w-full mt-3 px-3 py-2 text-xs text-red-400 hover:text-red-300 transition-colors">
+          <button onClick={handleLeaveRoom} className="w-full mt-3 px-3 py-3 text-xs text-red-400 hover:text-red-300 active:text-red-300 transition-colors touch-manipulation min-h-[44px]">
             Leave Room
           </button>
         </div>

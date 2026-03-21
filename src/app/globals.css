@@ -88,16 +88,45 @@
 ::before,
 ::after {
   border-color: hsl(var(--border));
+  -webkit-tap-highlight-color: transparent;
 }
 
 body {
   background-color: hsl(var(--background));
   color: hsl(var(--foreground));
+  /* Respect iOS safe areas (notch, home indicator) */
+  padding-top: env(safe-area-inset-top);
+  padding-left: env(safe-area-inset-left);
+  padding-right: env(safe-area-inset-right);
+  padding-bottom: env(safe-area-inset-bottom);
+}
+
+/* Prevent iOS Safari auto-zoom on input focus */
+input,
+textarea,
+select {
+  font-size: 16px !important;
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+/* Smooth momentum scrolling on iOS */
+.overflow-y-auto,
+.overflow-y-scroll {
+  -webkit-overflow-scrolling: touch;
+}
+
+/* Active state feedback for touch devices (hover doesn't fire on touch) */
+@media (hover: none) {
+  button:active {
+    opacity: 0.75;
+  }
 }
 
 /* ---- Custom utility classes ---- */
 @utility glass-card {
   background-color: color-mix(in srgb, var(--color-bg-card) 80%, transparent);
+  -webkit-backdrop-filter: blur(4px);
   backdrop-filter: blur(4px);
   border: 1px solid rgb(255 255 255 / 0.1);
   box-shadow: 0 10px 15px -3px rgb(0 0 0 / 0.1), 0 4px 6px -4px rgb(0 0 0 / 0.1);
@@ -110,9 +139,15 @@ body {
   transition: all 0.2s;
   background-color: var(--color-accent-star);
   color: var(--color-bg-primary);
+  min-height: 44px;
+  touch-action: manipulation;
   &:hover {
     background-color: rgb(0 217 255 / 0.9);
     scale: 1.05;
+  }
+  &:active {
+    scale: 0.97;
+    background-color: rgb(0 217 255 / 0.9);
   }
 }
 
@@ -124,9 +159,15 @@ body {
   background-color: var(--color-bg-card);
   border: 1px solid rgb(255 255 255 / 0.2);
   color: white;
+  min-height: 44px;
+  touch-action: manipulation;
   &:hover {
     background-color: rgb(26 26 46 / 0.9);
     scale: 1.05;
+  }
+  &:active {
+    scale: 0.97;
+    background-color: rgb(26 26 46 / 0.9);
   }
 }
 

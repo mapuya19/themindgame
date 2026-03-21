@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useState, useRef } from 'react';
-import { useRouter, useParams } from 'next/navigation';
+import { useRouter, useParams, useSearchParams } from 'next/navigation';
 import { useGameStore } from '@/lib/store';
 import { GameClient } from '@/lib/ws-client';
 import { motion, AnimatePresence } from 'framer-motion';
@@ -10,6 +10,8 @@ export default function LobbyPage() {
   const router = useRouter();
   const params = useParams();
   const roomCode = (params.code as string).toUpperCase();
+  const searchParams = useSearchParams();
+  const isJoining = searchParams.get('join') === '1';
 
   const [isConnected, setIsConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -55,6 +57,15 @@ export default function LobbyPage() {
         setError(msg.message);
       }
 
+      // If we joined via the join form and we're the only player,
+      // the room was empty — no one created it. Go back with an error.
+      if (msg.type === 'state' && isJoining && msg.state.players.length === 1) {
+        cancelled = true;
+        client.disconnect();
+        router.replace(`/?error=Room+%22${roomCode}%22+not+found`);
+        return;
+      }
+
       if (msg.type === 'state' && msg.state.status === 'playing') {
         router.push(`/room/${roomCode}/game`);
       }
@@ -91,7 +102,7 @@ export default function LobbyPage() {
       <AnimatePresence>
         {!isConnected && (
           <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
-            className="absolute inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center">
+            className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center">
             <div className="text-center">
               <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-accent-star mx-auto mb-4" />
               <p className="text-white text-lg">Connecting...</p>
