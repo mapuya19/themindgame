@@ -1,0 +1,11 @@
+# dependencies
+node_modules/
+
+# wrangler
+.wrangler/
+
+# debug
+npm-debug.log*
+
+# misc
+.DS_Store

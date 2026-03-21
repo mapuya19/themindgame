@@ -1,8 +1,11 @@
+// ---------------------------------------------------------------------------
+// Shared types for the client ↔ server WebSocket protocol
+// ---------------------------------------------------------------------------
+
 export interface Player {
   id: string;
   name: string;
-  isConnected: boolean;
-  isCoordinator: boolean;
+  connected: boolean;
   cardCount: number;
 }
 
@@ -13,29 +16,28 @@ export interface GameState {
   lives: number;
   shurikens: number;
   playedCards: number[];
+  discardedCards: number[];
   hand: number[];
   status: 'waiting' | 'playing' | 'level_complete' | 'game_over' | 'victory';
   shurikenVoteActive: boolean;
   shurikenVotes: Record<string, boolean>;
 }
 
-export interface GameConfig {
-  playerCount: number;
-  maxLevels: number;
-  startingLives: number;
-  startingShurikens: number;
-}
+// Messages the client sends to the server
+export type ClientMessage =
+  | { type: 'join'; name: string }
+  | { type: 'start_game' }
+  | { type: 'play_card'; card: number }
+  | { type: 'vote_shuriken'; vote: boolean }
+  | { type: 'restart_game' };
 
-export type GameAction =
-  | { type: 'CARD_PLAYED'; card: number; playerId: string }
-  | { type: 'SHURIKEN_VOTE'; playerId: string; vote: boolean }
-  | { type: 'SHURIKEN_USED'; discardedCards: Record<string, number> }
-  | { type: 'WRONG_PLAY'; card: number; lowerCards: number[] }
-  | { type: 'LEVEL_COMPLETE'; bonusLives: number; bonusShurikens: number }
-  | { type: 'GAME_OVER'; reason: 'victory' | 'no_lives' }
-  | { type: 'STATE_REQUEST'; playerId: string }
-  | { type: 'STATE_RESPONSE'; state: Partial<GameState> }
-  | { type: 'PLAYER_JOINED'; player: Player }
-  | { type: 'PLAYERS_SYNC'; players: Player[] }
-  | { type: 'PLAYER_LEFT'; playerId: string }
-  | { type: 'GAME_STARTED'; config: GameConfig; hands: Record<string, number[]> };
+// Messages the server sends to the client
+export type ServerMessage =
+  | { type: 'state'; state: GameState }
+  | { type: 'error'; message: string }
+  | { type: 'card_played'; card: number; playerId: string }
+  | { type: 'wrong_play'; card: number; lowerCards: number[]; livesLeft: number }
+  | { type: 'level_complete'; level: number; bonusLives: number; bonusShurikens: number }
+  | { type: 'game_over'; reason: 'victory' | 'no_lives' }
+  | { type: 'shuriken_vote'; playerId: string; vote: boolean }
+  | { type: 'shuriken_used'; discardedCards: Record<string, number> };
