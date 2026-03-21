@@ -112,6 +112,8 @@ interface ClientState {
 
 export interface Env {
   GAME_ROOM: DurableObjectNamespace<GameRoom>;
+  /** Optional secret for the admin purge endpoint. Set via wrangler secret. */
+  ADMIN_SECRET?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -144,6 +146,14 @@ export class GameRoom extends DurableObject<Env> {
   /** How long after game over/victory before storage is cleaned up (ms) */
   private static readonly GAME_OVER_CLEANUP = 300_000; // 5 minutes
 
+  /**
+   * How long a room can be completely idle (no connected WebSockets and no
+   * pending disconnect timers) before it is deleted automatically.  This is
+   * the safety net for rooms whose players all vanished without a clean WS
+   * close — e.g. iOS Safari backgrounding the tab or a network drop.
+   */
+  private static readonly IDLE_ROOM_CLEANUP = 3_600_000; // 1 hour
+
   /** Timestamp when the finished-game cleanup alarm should fire, or null */
   private gameOverCleanupAt: number | null = null;
 
@@ -151,13 +161,31 @@ export class GameRoom extends DurableObject<Env> {
     super(ctx, env);
   }
 
-  // Restore state from storage on first access
+  // Restore state from storage on first access.
+  // Also self-heals stale rooms that were persisted before the idle-cleanup
+  // alarm logic existed — if storage has data but no alarm is set and no
+  // sockets are connected, we immediately schedule the idle-cleanup alarm so
+  // the room will eventually delete itself even if no one ever reconnects.
   private async ensureLoaded() {
     if (this.initialized) return;
     this.initialized = true;
     const saved = await this.ctx.storage.get<RoomState>("room");
     if (saved) {
       this.state = saved;
+
+      // Self-heal: schedule idle cleanup for rooms with no active alarm
+      const existingAlarm = await this.ctx.storage.getAlarm();
+      if (existingAlarm === null) {
+        const hasConnectedSockets = this.ctx.getWebSockets().some(
+          ws => this.getPlayerId(ws) !== null
+        );
+        if (!hasConnectedSockets) {
+          // Room is loaded but abandoned — set a 1-hour idle cleanup alarm.
+          // This fires the next time the DO wakes (e.g. a new connection
+          // attempt, or automatically after deploy if Cloudflare activates it).
+          await this.ctx.storage.setAlarm(Date.now() + GameRoom.IDLE_ROOM_CLEANUP);
+        }
+      }
     }
   }
 
@@ -170,6 +198,26 @@ export class GameRoom extends DurableObject<Env> {
 
   async fetch(request: Request): Promise<Response> {
     await this.ensureLoaded();
+
+    const url = new URL(request.url);
+
+    // GET /room/:code/exists — returns whether this room has any players.
+    // Used by the client to validate a room code before joining.
+    if (request.method === "GET" && url.pathname.endsWith("/exists")) {
+      const exists = this.state.players.length > 0;
+      return new Response(JSON.stringify({ exists }), {
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    // TEMP: DELETE /room/:code/purge — wipes storage on this specific DO instance.
+    if (request.method === "DELETE" && url.pathname.endsWith("/purge")) {
+      await this.ctx.storage.deleteAll();
+      this.initialized = false;
+      return new Response(JSON.stringify({ purged: true }), {
+        headers: { "Content-Type": "application/json" },
+      });
+    }
 
     // Accept WebSocket — the Upgrade header is always present on the
     // Worker→DO internal hop when the browser initiated a WS connection.
@@ -226,6 +274,10 @@ export class GameRoom extends DurableObject<Env> {
 
       // Broadcast updated connection status immediately
       this.broadcastState();
+    } else {
+      // Socket that never completed a join — schedule idle cleanup in case
+      // the room has no other connected players.
+      await this.scheduleNextAlarm();
     }
   }
 
@@ -535,6 +587,16 @@ export class GameRoom extends DurableObject<Env> {
       }
     }
 
+    // Idle room cleanup: if no sockets are connected and no disconnect timers
+    // are pending, schedule a safety-net deletion to reclaim resources.
+    const hasConnectedSockets = this.ctx.getWebSockets().some(
+      ws => this.getPlayerId(ws) !== null
+    );
+    if (!hasConnectedSockets && this.disconnectTimers.size === 0 && this.state.players.length > 0) {
+      const idleCleanupAt = Date.now() + GameRoom.IDLE_ROOM_CLEANUP;
+      if (earliest === null || idleCleanupAt < earliest) earliest = idleCleanupAt;
+    }
+
     if (earliest !== null) {
       // Only set if it's sooner than any existing alarm
       const current = await this.ctx.storage.getAlarm();
@@ -601,8 +663,7 @@ export class GameRoom extends DurableObject<Env> {
     this.broadcastState();
   }
 
-  async alarm() {
-    await this.ensureLoaded();
+  async alarm() {    await this.ensureLoaded();
     const now = Date.now();
 
     // Process disconnect timers
@@ -638,6 +699,18 @@ export class GameRoom extends DurableObject<Env> {
       return;
     }
 
+    // Idle room cleanup: delete abandoned rooms that have had no connected
+    // sockets for the full IDLE_ROOM_CLEANUP window.  This fires when the
+    // alarm set by scheduleNextAlarm() matures without anyone reconnecting.
+    const hasConnectedSockets = this.ctx.getWebSockets().some(
+      ws => this.getPlayerId(ws) !== null
+    );
+    if (!hasConnectedSockets && this.disconnectTimers.size === 0 && this.state.players.length > 0) {
+      await this.ctx.storage.deleteAll();
+      this.initialized = false;
+      return;
+    }
+
     // If there are remaining timers, schedule the next alarm
     await this.scheduleNextAlarm();
   }
@@ -654,29 +727,48 @@ export default {
     // CORS headers for the Next.js frontend
     const corsHeaders = {
       "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Upgrade",
+      "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type, Upgrade, X-Admin-Secret",
     };
 
     if (request.method === "OPTIONS") {
       return new Response(null, { headers: corsHeaders });
     }
 
+    // Admin: DELETE /admin/purge/:code — forcibly delete a stale room's storage.
+    // Requires the X-Admin-Secret header to match the ADMIN_SECRET binding.
+    // Example: curl -X DELETE https://worker.example.com/admin/purge/ABCD \
+    //               -H "X-Admin-Secret: your-secret"
+    const purgeMatch = url.pathname.match(/^\/admin\/purge\/([A-Z0-9]{4})$/i);
+    if (purgeMatch && request.method === "DELETE") {
+      const providedSecret = request.headers.get("X-Admin-Secret");
+      if (!env.ADMIN_SECRET || providedSecret !== env.ADMIN_SECRET) {
+        return new Response("Unauthorized", { status: 401, headers: corsHeaders });
+      }
+      const roomCode = purgeMatch[1].toUpperCase();
+      const id = env.GAME_ROOM.idFromName(roomCode);
+      const stub = env.GAME_ROOM.get(id);
+      return stub.fetch(
+        new Request(`${url.origin}/room/${roomCode}/purge`, { method: "DELETE" }),
+      );
+    }
+
     // Route: /room/:code — proxy to Durable Object by room code
     const match = url.pathname.match(/^\/room\/([A-Z0-9]{4})$/i);
     if (match) {
       const roomCode = match[1].toUpperCase();
-
-      // Only forward WebSocket upgrade requests to the Durable Object
-      const upgradeHeader = request.headers.get("Upgrade");
-      if (!upgradeHeader || upgradeHeader !== "websocket") {
-        return new Response(JSON.stringify({ room: roomCode, hint: "Use WebSocket to connect" }), {
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        });
-      }
-
       const id = env.GAME_ROOM.idFromName(roomCode);
       const stub = env.GAME_ROOM.get(id);
+
+      // GET /room/:code — check if room exists (no WS upgrade)
+      const upgradeHeader = request.headers.get("Upgrade");
+      if (!upgradeHeader || upgradeHeader !== "websocket") {
+        return stub.fetch(
+          new Request(`${url.origin}/room/${roomCode}/exists`, { method: "GET" })
+        );
+      }
+
+      // WebSocket upgrade — connect to the room
       return stub.fetch(request);
     }
 

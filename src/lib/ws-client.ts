@@ -10,6 +10,23 @@ import type { ClientMessage, ServerMessage } from '@/types/game';
 
 const WS_BASE = process.env.NEXT_PUBLIC_WS_URL ?? 'ws://localhost:8787';
 
+// Derive the HTTP base URL from the WS base for REST calls (e.g. exists check).
+const HTTP_BASE = WS_BASE
+  .replace(/^wss:\/\//, 'https://')
+  .replace(/^ws:\/\//, 'http://');
+
+/** Returns true if the room exists (has at least one player registered). */
+export async function checkRoomExists(roomCode: string): Promise<boolean> {
+  try {
+    const res = await fetch(`${HTTP_BASE}/room/${roomCode.toUpperCase()}`);
+    if (!res.ok) return false;
+    const data = await res.json() as { exists?: boolean };
+    return data.exists === true;
+  } catch {
+    return false;
+  }
+}
+
 export class GameClient {
   private ws: WebSocket | null = null;
   private roomCode: string;
