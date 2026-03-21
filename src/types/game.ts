@@ -40,4 +40,5 @@ export type ServerMessage =
   | { type: 'level_complete'; level: number; bonusLives: number; bonusShurikens: number }
   | { type: 'game_over'; reason: 'victory' | 'no_lives' }
   | { type: 'shuriken_vote'; playerId: string; vote: boolean }
-  | { type: 'shuriken_used'; discardedCards: Record<string, number> };
+  | { type: 'shuriken_used'; discardedCards: Record<string, number> }
+  | { type: 'player_left'; playerId: string; playerName: string };

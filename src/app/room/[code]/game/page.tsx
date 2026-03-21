@@ -15,6 +15,7 @@ export default function GamePage() {
   const [showLevelComplete, setShowLevelComplete] = useState(false);
   const [showRules, setShowRules] = useState(false);
   const [wrongPlayInfo, setWrongPlayInfo] = useState<{ card: number; lowerCards: number[]; livesLeft: number } | null>(null);
+  const [playerLeftInfo, setPlayerLeftInfo] = useState<{ playerName: string } | null>(null);
   const [selectedCard, setSelectedCard] = useState<number | null>(null);
   const clientRef = useRef<GameClient | null>(null);
 
@@ -68,6 +69,11 @@ export default function GamePage() {
       if (msg.type === 'wrong_play') {
         setWrongPlayInfo({ card: msg.card, lowerCards: msg.lowerCards, livesLeft: msg.livesLeft });
         setTimeout(() => setWrongPlayInfo(null), 3000);
+      }
+
+      if (msg.type === 'player_left') {
+        setPlayerLeftInfo({ playerName: msg.playerName });
+        setTimeout(() => setPlayerLeftInfo(null), 3000);
       }
 
       // Navigate back to lobby when game is restarted
@@ -155,6 +161,23 @@ export default function GamePage() {
                 {wrongPlayInfo.lowerCards.length === 1 ? 'was' : 'were'} still in play
               </p>
               <p className="text-xs text-accent-life">{wrongPlayInfo.livesLeft} {wrongPlayInfo.livesLeft === 1 ? 'life' : 'lives'} remaining</p>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Player Left Notification */}
+      <AnimatePresence>
+        {playerLeftInfo && (
+          <motion.div
+            initial={{ opacity: 0, y: -50 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -50 }}
+            className="absolute top-20 left-1/2 -translate-x-1/2 z-50"
+          >
+            <div className="glass-card rounded-xl p-4 border border-yellow-500/40 bg-yellow-900/30 text-center max-w-sm">
+              <p className="text-yellow-400 font-bold mb-1">Player Left</p>
+              <p className="text-sm text-gray-300">{playerLeftInfo.playerName} has left the game. Their cards were discarded.</p>
             </div>
           </motion.div>
         )}
@@ -378,7 +401,7 @@ export default function GamePage() {
             <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="mt-3 p-2 bg-accent-star/10 border border-accent-star/30 rounded text-center">
               <p className="text-xs text-gray-400 mb-2">Shuriken vote in progress</p>
               <p className="text-sm text-accent-star mb-2">
-                {Object.values(shurikenVotes).filter(Boolean).length} / {players.length}
+                {Object.values(shurikenVotes).filter(Boolean).length} / {players.filter(p => p.connected).length}
               </p>
               <div className="flex gap-2">
                 <button onClick={() => handleShurikenVote(true)}

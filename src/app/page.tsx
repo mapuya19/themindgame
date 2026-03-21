@@ -124,7 +124,7 @@ export default function Home() {
           transition={{ duration: 0.5, delay: 0.3 }}
           className="flex items-center justify-center gap-4 mb-10 text-xs text-gray-500"
         >
-          <span>2-4 Players</span>
+          <span>2-8 Players</span>
           <span className="w-1 h-1 rounded-full bg-gray-600" />
           <span>Real-time Online</span>
           <span className="w-1 h-1 rounded-full bg-gray-600" />

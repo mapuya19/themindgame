@@ -89,7 +89,8 @@ type ServerMsg =
   | { type: "level_complete"; level: number; bonusLives: number; bonusShurikens: number }
   | { type: "game_over"; reason: "victory" | "no_lives" }
   | { type: "shuriken_vote"; playerId: string; vote: boolean }
-  | { type: "shuriken_used"; discardedCards: Record<string, number> };
+  | { type: "shuriken_used"; discardedCards: Record<string, number> }
+  | { type: "player_left"; playerId: string; playerName: string };
 
 interface ClientState {
   roomCode: string;
@@ -130,6 +131,21 @@ export class GameRoom extends DurableObject<Env> {
     shurikenVotes: {},
   };
   private initialized = false;
+
+  /** Maps playerId → timestamp when their disconnect timeout fires */
+  private disconnectTimers: Map<string, number> = new Map();
+
+  /** How long to wait before removing a disconnected player (ms) */
+  private static readonly DISCONNECT_TIMEOUT = 30_000;
+
+  /** How long to wait before cleaning up an empty room (ms) */
+  private static readonly EMPTY_ROOM_CLEANUP = 60_000;
+
+  /** How long after game over/victory before storage is cleaned up (ms) */
+  private static readonly GAME_OVER_CLEANUP = 300_000; // 5 minutes
+
+  /** Timestamp when the finished-game cleanup alarm should fire, or null */
+  private gameOverCleanupAt: number | null = null;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -203,6 +219,12 @@ export class GameRoom extends DurableObject<Env> {
   async webSocketClose(ws: WebSocket) {
     const playerId = this.getPlayerId(ws);
     if (playerId) {
+      // Schedule removal after timeout
+      const removeAt = Date.now() + GameRoom.DISCONNECT_TIMEOUT;
+      this.disconnectTimers.set(playerId, removeAt);
+      await this.scheduleNextAlarm();
+
+      // Broadcast updated connection status immediately
       this.broadcastState();
     }
   }
@@ -284,8 +306,9 @@ export class GameRoom extends DurableObject<Env> {
     // Check if this name already exists (reconnecting)
     const existing = this.state.players.find(p => p.name === name);
     if (existing) {
-      // Reconnect: reuse their player ID
+      // Reconnect: reuse their player ID and cancel any pending removal
       ws.serializeAttachment({ playerId: existing.id });
+      this.disconnectTimers.delete(existing.id);
     } else {
       this.state.players.push({ id: playerId, name });
     }
@@ -384,6 +407,7 @@ export class GameRoom extends DurableObject<Env> {
         this.broadcast({ type: "game_over", reason: "no_lives" });
         await this.saveState();
         this.broadcastState();
+        await this.scheduleGameOverCleanup();
         return;
       }
 
@@ -420,6 +444,7 @@ export class GameRoom extends DurableObject<Env> {
         this.broadcast({ type: "game_over", reason: "victory" });
         await this.saveState();
         this.broadcastState();
+        await this.scheduleGameOverCleanup();
       } else {
         this.state.status = "level_complete";
         this.broadcast({
@@ -483,13 +508,138 @@ export class GameRoom extends DurableObject<Env> {
     this.broadcastState();
   }
 
-  // ---- Alarm (for delayed level deal) ------------------------------------
+  // ---- Alarm (handles both level deal and disconnect/cleanup timers) ------
+
+  /**
+   * Schedule the next alarm for the earliest pending event.
+   * Durable Objects only support one alarm at a time, so we pick the soonest.
+   */
+  private async scheduleNextAlarm() {
+    let earliest: number | null = null;
+
+    // Level auto-advance alarm
+    if (this.state.status === "level_complete") {
+      // The level-complete alarm is set directly in checkLevelComplete;
+      // we don't override it here — just find the soonest overall.
+    }
+
+    // Disconnect timers
+    for (const time of this.disconnectTimers.values()) {
+      if (earliest === null || time < earliest) earliest = time;
+    }
+
+    // Game-over cleanup timer
+    if (this.gameOverCleanupAt !== null) {
+      if (earliest === null || this.gameOverCleanupAt < earliest) {
+        earliest = this.gameOverCleanupAt;
+      }
+    }
+
+    if (earliest !== null) {
+      // Only set if it's sooner than any existing alarm
+      const current = await this.ctx.storage.getAlarm();
+      if (current === null || earliest < current) {
+        await this.ctx.storage.setAlarm(earliest);
+      }
+    }
+  }
+
+  /** Schedule storage cleanup 5 minutes after game over/victory */
+  private async scheduleGameOverCleanup() {
+    this.gameOverCleanupAt = Date.now() + GameRoom.GAME_OVER_CLEANUP;
+    await this.scheduleNextAlarm();
+  }
+
+  /**
+   * Remove a player from the room. In the lobby, just delete them.
+   * Mid-game, discard their hand and check for level completion / game over.
+   */
+  private async removePlayer(playerId: string) {
+    const player = this.state.players.find(p => p.id === playerId);
+    if (!player) return;
+
+    const playerName = player.name;
+
+    // Remove from player list
+    this.state.players = this.state.players.filter(p => p.id !== playerId);
+
+    // Clean up their game state
+    const discardedHand = this.state.playerHands[playerId] ?? [];
+    if (discardedHand.length > 0) {
+      this.state.discardedCards.push(...discardedHand);
+    }
+    delete this.state.playerHands[playerId];
+    delete this.state.shurikenVotes[playerId];
+
+    // Notify remaining players
+    this.broadcast({ type: "player_left", playerId, playerName });
+
+    // If no players left, clean up the room entirely
+    if (this.state.players.length === 0) {
+      await this.ctx.storage.deleteAll();
+      this.initialized = false;
+      return;
+    }
+
+    // If mid-game and only 1 player remains, end the game
+    if (this.state.status === "playing" && this.state.players.length < 2) {
+      this.state.status = "game_over";
+      this.broadcast({ type: "game_over", reason: "no_lives" });
+      await this.saveState();
+      this.broadcastState();
+      await this.scheduleGameOverCleanup();
+      return;
+    }
+
+    // If mid-game, discarding this player's hand may complete the level
+    if (this.state.status === "playing") {
+      await this.checkLevelComplete();
+      return;
+    }
+
+    await this.saveState();
+    this.broadcastState();
+  }
 
   async alarm() {
     await this.ensureLoaded();
+    const now = Date.now();
+
+    // Process disconnect timers
+    const expired: string[] = [];
+    for (const [playerId, time] of this.disconnectTimers) {
+      if (time <= now) expired.push(playerId);
+    }
+    for (const playerId of expired) {
+      this.disconnectTimers.delete(playerId);
+      // Only remove if they're still disconnected (no active WebSocket)
+      const stillConnected = this.ctx.getWebSockets().some(
+        ws => this.getPlayerId(ws) === playerId
+      );
+      if (!stillConnected) {
+        await this.removePlayer(playerId);
+      }
+    }
+
+    // Handle level auto-advance
     if (this.state.status === "level_complete") {
       await this.dealNextLevel();
     }
+
+    // Handle game-over storage cleanup
+    if (
+      this.gameOverCleanupAt !== null &&
+      now >= this.gameOverCleanupAt &&
+      (this.state.status === "game_over" || this.state.status === "victory")
+    ) {
+      this.gameOverCleanupAt = null;
+      await this.ctx.storage.deleteAll();
+      this.initialized = false;
+      return;
+    }
+
+    // If there are remaining timers, schedule the next alarm
+    await this.scheduleNextAlarm();
   }
 }
 
