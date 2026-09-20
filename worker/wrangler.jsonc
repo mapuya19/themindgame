@@ -3,6 +3,9 @@
   "name": "themind-server",
   "main": "src/index.ts",
   "compatibility_date": "2024-12-01",
+  "vars": {
+    "ALLOWED_ORIGINS": "https://themindgame.vercel.app"
+  },
   "durable_objects": {
     "bindings": [
       {

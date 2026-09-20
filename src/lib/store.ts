@@ -23,6 +23,10 @@ interface StoreState extends GameState {
 
 const INITIAL_STATE: GameState = {
   roomCode: '',
+  mode: 'standard',
+  minPlayers: 2,
+  maxPlayers: 8,
+  maxLevels: 0,
   players: [],
   level: 0,
   lives: 0,
@@ -61,7 +65,7 @@ export const useGameStore = create<StoreState>()((set) => ({
       case 'shuriken_used':
       case 'level_complete':
       case 'game_over':
-        // Store the event for UI animations, then auto-clear
+      case 'player_left':
         set({ lastEvent: msg });
         break;
       default:

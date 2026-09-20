@@ -3,7 +3,7 @@
 import { useEffect, useState, useRef } from 'react';
 import { useRouter, useParams } from 'next/navigation';
 import { useGameStore } from '@/lib/store';
-import { GameClient } from '@/lib/ws-client';
+import { checkRoomExists, GameClient } from '@/lib/ws-client';
 import { motion, AnimatePresence } from 'framer-motion';
 
 export default function GamePage() {
@@ -21,8 +21,8 @@ export default function GamePage() {
 
   const {
     hand, playedCards, discardedCards, level, lives, shurikens,
-    players, status, shurikenVoteActive, shurikenVotes,
-    handleServerMessage,
+    players, status, shurikenVoteActive, shurikenVotes, maxLevels,
+    handleServerMessage, reset,
   } = useGameStore();
 
   const [playerName, setPlayerName] = useState<string | null>(null);
@@ -30,8 +30,16 @@ export default function GamePage() {
   // Read localStorage after hydration to avoid server/client mismatch
   useEffect(() => {
     const name = localStorage.getItem('themind-player-name') || '';
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- localStorage is client-only.
     setPlayerName(name);
   }, []);
+
+  useEffect(() => {
+    if (!showRules) return;
+    const onKeyDown = (event: KeyboardEvent) => { if (event.key === 'Escape') setShowRules(false); };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [showRules]);
 
   // ---- WebSocket connection -----------------------------------------------
   useEffect(() => {
@@ -41,55 +49,52 @@ export default function GamePage() {
     }
 
     let cancelled = false;
-
-    const client = new GameClient(roomCode);
-    clientRef.current = client;
-
-    client.onConnect(() => {
-      if (cancelled) return;
-      setIsConnected(true);
-      // Re-join to restore our identity
-      client.send({ type: 'join', name: playerName });
-    });
-
-    client.onDisconnect(() => {
-      if (cancelled) return;
-      setIsConnected(false);
-    });
-
-    client.onMessage((msg) => {
-      if (cancelled) return;
-      handleServerMessage(msg);
-
-      if (msg.type === 'level_complete') {
-        setShowLevelComplete(true);
-        setTimeout(() => setShowLevelComplete(false), 3000);
+    reset();
+    const connect = async () => {
+      if (!await checkRoomExists(roomCode) || cancelled) {
+        if (!cancelled) router.replace(`/?error=Room+%22${roomCode}%22+not+found`);
+        return;
       }
-
-      if (msg.type === 'wrong_play') {
-        setWrongPlayInfo({ card: msg.card, lowerCards: msg.lowerCards, livesLeft: msg.livesLeft });
-        setTimeout(() => setWrongPlayInfo(null), 3000);
-      }
-
-      if (msg.type === 'player_left') {
-        setPlayerLeftInfo({ playerName: msg.playerName });
-        setTimeout(() => setPlayerLeftInfo(null), 3000);
-      }
-
-      // Navigate back to lobby when game is restarted
-      if (msg.type === 'state' && msg.state.status === 'waiting') {
-        router.push(`/room/${roomCode}`);
-      }
-    });
-
-    client.connect();
+      const client = new GameClient(roomCode);
+      clientRef.current = client;
+      client.onConnect(() => {
+        if (cancelled) return;
+        setIsConnected(true);
+        client.send({
+          type: 'join',
+          name: playerName,
+          resumeToken: localStorage.getItem(`themind-session-${roomCode}`) || undefined,
+        });
+      });
+      client.onDisconnect(() => { if (!cancelled) setIsConnected(false); });
+      client.onMessage((msg) => {
+        if (cancelled) return;
+        handleServerMessage(msg);
+        if (msg.type === 'joined') localStorage.setItem(`themind-session-${roomCode}`, msg.resumeToken);
+        if (msg.type === 'level_complete') {
+          setShowLevelComplete(true);
+          setTimeout(() => setShowLevelComplete(false), 3000);
+        }
+        if (msg.type === 'wrong_play') {
+          setWrongPlayInfo({ card: msg.card, lowerCards: msg.lowerCards, livesLeft: msg.livesLeft });
+          setTimeout(() => setWrongPlayInfo(null), 3000);
+        }
+        if (msg.type === 'player_left') {
+          setPlayerLeftInfo({ playerName: msg.playerName });
+          setTimeout(() => setPlayerLeftInfo(null), 3000);
+        }
+        if (msg.type === 'state' && msg.state.status === 'waiting') router.push(`/room/${roomCode}`);
+      });
+      client.connect();
+    };
+    void connect();
 
     return () => {
       cancelled = true;
-      client.disconnect();
+      clientRef.current?.disconnect();
+      clientRef.current = null;
     };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [roomCode, playerName]);
+  }, [roomCode, playerName, router, handleServerMessage, reset]);
 
   // ---- handlers -----------------------------------------------------------
   const handleCardPlay = (card: number) => {
@@ -104,6 +109,7 @@ export default function GamePage() {
   };
 
   const handleLeaveRoom = () => {
+    clientRef.current?.send({ type: 'leave_room' });
     clientRef.current?.disconnect();
     router.push('/');
   };
@@ -121,11 +127,13 @@ export default function GamePage() {
   };
 
   const isGameOver = status === 'game_over' || status === 'victory';
+  const visiblePlayedCards = playedCards.slice(-24);
+  const visibleDiscardedCards = discardedCards.slice(-24);
 
   if (!playerName) return null;
 
   return (
-    <div className="min-h-screen flex flex-col p-4 bg-gradient-to-br from-bg-primary via-bg-mid to-bg-primary overflow-hidden">
+    <div className="h-[100dvh] flex flex-col p-4 bg-gradient-to-br from-bg-primary via-bg-mid to-bg-primary overflow-y-auto">
       {/* Reconnecting overlay */}
       <AnimatePresence>
         {!isConnected && (
@@ -134,6 +142,18 @@ export default function GamePage() {
             <div className="text-center">
               <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-accent-star mx-auto mb-4" />
               <p className="text-white text-lg">Reconnecting...</p>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      <AnimatePresence>
+        {status === 'paused' && (
+          <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+            className="fixed inset-0 z-40 flex items-center justify-center bg-black/70 backdrop-blur-sm" role="alert" aria-live="assertive">
+            <div className="glass-card rounded-2xl p-8 text-center max-w-md mx-4">
+              <h2 className="text-3xl font-bold text-accent-star mb-2">Game Paused</h2>
+              <p className="text-gray-300">Waiting for a disconnected player to return.</p>
             </div>
           </motion.div>
         )}
@@ -222,13 +242,13 @@ export default function GamePage() {
         {showRules && (
           <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
             className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm"
-            onClick={() => setShowRules(false)}>
+            onClick={() => setShowRules(false)} role="dialog" aria-modal="true" aria-labelledby="game-rules-title">
             <motion.div initial={{ opacity: 0, scale: 0.9 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 0.9 }}
               className="glass-card rounded-2xl p-6 max-w-lg mx-4 max-h-[min(80vh,_calc(100dvh_-_4rem))] overflow-y-auto"
               onClick={e => e.stopPropagation()}>
               <div className="flex justify-between items-center mb-4">
-                <h2 className="text-2xl font-bold text-white">How to Play</h2>
-                <button onClick={() => setShowRules(false)} className="text-gray-400 hover:text-white w-11 h-11 flex items-center justify-center text-xl rounded-lg touch-manipulation">&times;</button>
+                <h2 id="game-rules-title" className="text-2xl font-bold text-white">How to Play</h2>
+                <button autoFocus aria-label="Close rules" onClick={() => setShowRules(false)} className="text-gray-400 hover:text-white w-11 h-11 flex items-center justify-center text-xl rounded-lg touch-manipulation">&times;</button>
               </div>
               <div className="space-y-4 text-sm text-gray-300">
                 <div>
@@ -273,7 +293,7 @@ export default function GamePage() {
         <div className="flex justify-between items-center">
           <div className="text-center">
             <p className="text-xs text-gray-400 uppercase tracking-wider">Level</p>
-            <p className="text-2xl font-bold text-white">{level}</p>
+            <p className="text-2xl font-bold text-white">{level}<span className="text-sm text-gray-500">/{maxLevels}</span></p>
           </div>
           <div className="text-center">
             <p className="text-xs text-gray-400 uppercase tracking-wider">Lives</p>
@@ -320,7 +340,7 @@ export default function GamePage() {
           </p>
           {playedCards.length > 0 ? (
             <div className="flex flex-wrap gap-2 justify-center">
-              {playedCards.map((card, index) => (
+              {visiblePlayedCards.map((card, index) => (
                 <motion.div key={`played-${index}-${card}`}
                   initial={{ scale: 0.8, opacity: 0, y: -30 }}
                   animate={{ scale: 1, opacity: 1, y: 0 }}
@@ -347,8 +367,8 @@ export default function GamePage() {
             <p className="text-xs text-red-400 uppercase tracking-wider mb-3 text-center">
               Discarded ({discardedCards.length})
             </p>
-            <div className="flex flex-wrap gap-2 justify-center">
-              {discardedCards.map((card, index) => (
+            <div className="flex flex-wrap gap-2 justify-center max-h-44 overflow-y-auto">
+              {visibleDiscardedCards.map((card, index) => (
                 <motion.div key={`disc-${index}-${card}`}
                   initial={{ scale: 0, rotate: -10 }}
                   animate={{ scale: 1, rotate: 0 }}
@@ -384,7 +404,7 @@ export default function GamePage() {
 
         <div className="glass-card rounded-xl p-4">
           <h3 className="text-sm font-medium text-gray-400 mb-3">Players</h3>
-          <div className="space-y-2">
+          <div className="space-y-2 max-h-64 overflow-y-auto pr-1">
             {players.map((player) => (
               <div key={player.id}
                 className={`flex items-center justify-between p-2 rounded ${

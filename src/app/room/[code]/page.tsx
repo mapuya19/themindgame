@@ -1,28 +1,26 @@
 'use client';
 
 import { useEffect, useState, useRef } from 'react';
-import { useRouter, useParams, useSearchParams } from 'next/navigation';
+import { useRouter, useParams } from 'next/navigation';
 import { useGameStore } from '@/lib/store';
-import { GameClient } from '@/lib/ws-client';
+import { checkRoomExists, GameClient } from '@/lib/ws-client';
 import { motion, AnimatePresence } from 'framer-motion';
 
 export default function LobbyPage() {
   const router = useRouter();
   const params = useParams();
   const roomCode = (params.code as string).toUpperCase();
-  const searchParams = useSearchParams();
-  const isJoining = searchParams.get('join') === '1';
-
   const [isConnected, setIsConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [playerName, setPlayerName] = useState<string | null>(null);
   const clientRef = useRef<GameClient | null>(null);
 
-  const { players, handleServerMessage } = useGameStore();
+  const { players, minPlayers, maxPlayers, mode, handleServerMessage, reset } = useGameStore();
 
   // Read localStorage after hydration to avoid server/client mismatch
   useEffect(() => {
     const name = localStorage.getItem('themind-player-name') || '';
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- localStorage is client-only.
     setPlayerName(name);
   }, []);
 
@@ -33,60 +31,54 @@ export default function LobbyPage() {
     }
 
     let cancelled = false;
+    reset();
 
-    const client = new GameClient(roomCode);
-    clientRef.current = client;
-
-    client.onConnect(() => {
+    const connect = async () => {
+      const exists = await checkRoomExists(roomCode);
       if (cancelled) return;
-      setIsConnected(true);
-      setError(null);
-      client.send({ type: 'join', name: playerName });
-    });
-
-    client.onDisconnect(() => {
-      if (cancelled) return;
-      setIsConnected(false);
-    });
-
-    client.onMessage((msg) => {
-      if (cancelled) return;
-      handleServerMessage(msg);
-
-      if (msg.type === 'error') {
-        setError(msg.message);
-      }
-
-      // If we joined via the join form and we're the only player,
-      // the room was empty — no one created it. Go back with an error.
-      if (msg.type === 'state' && isJoining && msg.state.players.length === 1) {
-        cancelled = true;
-        client.disconnect();
+      if (!exists) {
         router.replace(`/?error=Room+%22${roomCode}%22+not+found`);
         return;
       }
 
-      if (msg.type === 'state' && msg.state.status === 'playing') {
-        router.push(`/room/${roomCode}/game`);
-      }
-    });
-
-    // Small delay lets React Strict Mode's teardown/remount cycle finish
-    // before opening the WebSocket, avoiding a wasted connection attempt.
-    client.connect();
+      const client = new GameClient(roomCode);
+      clientRef.current = client;
+      client.onConnect(() => {
+        if (cancelled) return;
+        setIsConnected(true);
+        setError(null);
+        const resumeToken = localStorage.getItem(`themind-session-${roomCode}`) || undefined;
+        client.send({ type: 'join', name: playerName, resumeToken });
+      });
+      client.onDisconnect(() => { if (!cancelled) setIsConnected(false); });
+      client.onMessage((msg) => {
+        if (cancelled) return;
+        handleServerMessage(msg);
+        if (msg.type === 'joined') localStorage.setItem(`themind-session-${roomCode}`, msg.resumeToken);
+        if (msg.type === 'error') setError(msg.message);
+        if (msg.type === 'state' && ['playing', 'paused', 'level_complete'].includes(msg.state.status)) {
+          router.push(`/room/${roomCode}/game`);
+        }
+      });
+      client.connect();
+    };
+    void connect();
 
     return () => {
       cancelled = true;
-      client.disconnect();
+      clientRef.current?.disconnect();
+      clientRef.current = null;
     };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [roomCode, playerName]);
+  }, [roomCode, playerName, router, handleServerMessage, reset]);
+
+  const canStart = players.length >= minPlayers && players.every(player => player.connected);
 
   const handleStartGame = () => {
     clientRef.current?.send({ type: 'start_game' });
   };
 
   const handleLeaveRoom = () => {
+    clientRef.current?.send({ type: 'leave_room' });
     clientRef.current?.disconnect();
     router.push('/');
   };
@@ -114,7 +106,7 @@ export default function LobbyPage() {
       <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.5 }} className="w-full max-w-2xl">
         <div className="glass-card rounded-2xl p-6 mb-6">
           <div className="text-center mb-6">
-            <h1 className="text-4xl font-bold text-white mb-2">Lobby</h1>
+            <h1 className="text-4xl font-bold text-white mb-2">{mode === 'large' ? 'Large Group Lobby' : 'Lobby'}</h1>
             <div className="flex items-center justify-center gap-2">
               <span className="text-gray-400">Room Code:</span>
               <button onClick={handleCopyRoomCode}
@@ -135,7 +127,7 @@ export default function LobbyPage() {
             <span className="text-sm text-gray-400">{isConnected ? 'Connected' : 'Connecting...'}</span>
           </div>
 
-          <div className="space-y-3 mb-6">
+          <div className="space-y-3 mb-6 max-h-[50dvh] overflow-y-auto pr-1">
             <h2 className="text-lg font-semibold text-white mb-3">Players</h2>
             <AnimatePresence>
               {players.map((player, index) => (
@@ -161,16 +153,16 @@ export default function LobbyPage() {
           </div>
 
           <div className="space-y-3">
-            <button onClick={handleStartGame} disabled={players.length < 2}
-              className={`w-full game-button-primary ${players.length < 2 ? 'opacity-50 cursor-not-allowed' : ''}`}>
-              Start Game {players.length < 2 && <span className="ml-2 text-sm opacity-70">(Need 2+ players)</span>}
+            <button onClick={handleStartGame} disabled={!canStart}
+              className={`w-full game-button-primary ${!canStart ? 'opacity-50 cursor-not-allowed' : ''}`}>
+              Start Game {!canStart && <span className="ml-2 text-sm opacity-70">({players.length < minPlayers ? `Need ${minPlayers}+ players` : 'Waiting for reconnection'})</span>}
             </button>
             <button onClick={handleLeaveRoom} className="w-full game-button-secondary">Leave Room</button>
           </div>
         </div>
 
         <div className="text-center text-sm text-gray-500">
-          <p>Any player can start the game once 2+ players have joined</p>
+          <p>Any player can start once {minPlayers}–{maxPlayers} players have joined</p>
         </div>
       </motion.div>
     </div>

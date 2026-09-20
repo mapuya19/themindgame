@@ -1,4 +1,4 @@
-import type { ClientMessage, ServerMessage } from '@/types/game';
+import type { ClientMessage, GameMode, ServerMessage } from '@/types/game';
 
 // ---------------------------------------------------------------------------
 // WebSocket client that connects to the Cloudflare Worker.
@@ -15,7 +15,20 @@ const HTTP_BASE = WS_BASE
   .replace(/^wss:\/\//, 'https://')
   .replace(/^ws:\/\//, 'http://');
 
-/** Returns true if the room exists (has at least one player registered). */
+/** Creates a server-owned room code, avoiding client-side code collisions. */
+export async function createRoom(mode: GameMode): Promise<string> {
+  const res = await fetch(`${HTTP_BASE}/rooms`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ mode }),
+  });
+  if (!res.ok) throw new Error('Could not create a room. Please try again.');
+  const data = await res.json() as { roomCode?: unknown };
+  if (typeof data.roomCode !== 'string') throw new Error('Invalid room response');
+  return data.roomCode;
+}
+
+/** Returns true only for a room created by the server and not yet cleaned up. */
 export async function checkRoomExists(roomCode: string): Promise<boolean> {
   try {
     const res = await fetch(`${HTTP_BASE}/room/${roomCode.toUpperCase()}`);
@@ -35,6 +48,7 @@ export class GameClient {
   private onDisconnectCb: (() => void) | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private shouldReconnect = true;
+  private reconnectAttempts = 0;
 
   constructor(roomCode: string) {
     this.roomCode = roomCode.toUpperCase();
@@ -50,6 +64,7 @@ export class GameClient {
 
     this.ws.onopen = () => {
       console.log('[WS] Connected');
+      this.reconnectAttempts = 0;
       this.onConnectCb?.();
     };
 
@@ -66,7 +81,9 @@ export class GameClient {
       console.log('[WS] Disconnected');
       this.onDisconnectCb?.();
       if (this.shouldReconnect) {
-        this.reconnectTimer = setTimeout(() => this.connect(), 2000);
+        const delay = Math.min(10_000, 500 * 2 ** this.reconnectAttempts) + Math.random() * 250;
+        this.reconnectAttempts++;
+        this.reconnectTimer = setTimeout(() => this.connect(), delay);
       }
     };
 
@@ -77,6 +94,7 @@ export class GameClient {
 
   disconnect(): void {
     this.shouldReconnect = false;
+    this.reconnectAttempts = 0;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     // Only close if the connection is open or connecting — avoids noisy
     // errors during React Strict Mode's double-invoke teardown in dev.

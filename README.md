@@ -64,22 +64,41 @@ Set `NEXT_PUBLIC_WS_URL` in `.env.local` to point at the worker:
 NEXT_PUBLIC_WS_URL=ws://localhost:8787
 ```
 
+For production, set these Worker secrets/variables before deployment:
+
+```bash
+cd worker
+npx wrangler secret put ADMIN_SECRET
+npx wrangler secret put ALLOWED_ORIGINS # e.g. https://your-app.example
+```
+
+`ALLOWED_ORIGINS` is a comma-separated allow-list. It may be omitted only for local development.
+
 ### Build & Deploy
 
 ```bash
 npm run build            # Build the Next.js frontend
+npm run test             # Run deterministic game-rule tests
+npm run typecheck:worker # Type-check the Durable Object
 npm run deploy:worker    # Deploy the Cloudflare Worker
 ```
 
 ## How the Game Works
 
-1. A player creates a room and shares the 4-letter code.
-2. 2-8 players join the room.
+1. A player creates a room and shares the server-generated 8-character code.
+2. 2-8 players join Standard mode, or 27-30 players join Large Group mode.
 3. Each round, players are dealt cards (round 1 = 1 card, round 2 = 2, etc.).
 4. Players must play their cards in ascending order across all hands -- without talking.
 5. Playing a card out of order costs a life. The team shares a pool of lives.
 6. Players can unanimously vote to use a Shuriken, which discards each player's lowest card.
 7. Clear all levels to win.
+
+### Modes
+
+- **Standard:** 2-8 players, with the original progression adapted for this app.
+- **Large Group:** 27-30 players and exactly three levels. A 100-card deck can deal at most three cards to each of 30 players (90 cards); level four would require more than 100 cards.
+
+The roster locks at game start. A temporary disconnect pauses the game for up to 30 seconds and can be resumed with the player session stored in that browser. An explicit leave (or an expired disconnect) forfeits that player's hand and the remaining players continue with the already selected level progression.
 
 ## License
 

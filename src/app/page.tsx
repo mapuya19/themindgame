@@ -1,8 +1,10 @@
 'use client';
 
-import { useState, Suspense } from 'react';
+import { useEffect, useState, Suspense } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { motion, AnimatePresence } from 'framer-motion';
+import { createRoom } from '@/lib/ws-client';
+import type { GameMode } from '@/types/game';
 
 const FLOATING_CARDS = [7, 23, 42, 56, 71, 88, 14, 35, 63, 91];
 
@@ -26,17 +28,30 @@ function HomeInner() {
   const [showRules, setShowRules] = useState(false);
   const [roomCodeInput, setRoomCodeInput] = useState('');
   const [joinError, setJoinError] = useState(searchParams.get('error') || '');
+  const [creating, setCreating] = useState<GameMode | null>(null);
 
-  const handleCreateRoom = () => {
+  useEffect(() => {
+    if (!showRules) return;
+    const onKeyDown = (event: KeyboardEvent) => { if (event.key === 'Escape') setShowRules(false); };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [showRules]);
+
+  const handleCreateRoom = async (mode: GameMode = 'standard') => {
     if (!playerName.trim()) {
-      alert('Please enter your name');
+      setJoinError('Please enter your name');
       return;
     }
-    localStorage.setItem('themind-player-name', playerName);
-    const letters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
-    let code = '';
-    for (let i = 0; i < 4; i++) code += letters[Math.floor(Math.random() * letters.length)];
-    router.push(`/room/${code}`);
+    setCreating(mode);
+    setJoinError('');
+    try {
+      localStorage.setItem('themind-player-name', playerName.trim());
+      const code = await createRoom(mode);
+      router.push(`/room/${code}?create=1`);
+    } catch (error) {
+      setJoinError(error instanceof Error ? error.message : 'Could not create room');
+      setCreating(null);
+    }
   };
 
   const handleJoinRoom = () => {
@@ -44,12 +59,12 @@ function HomeInner() {
       alert('Please enter your name');
       return;
     }
-    if (!roomCodeInput.trim() || roomCodeInput.trim().length !== 4) {
-      setJoinError('Please enter a 4-letter room code');
+    if (!/^[A-Z2-9]{8}$/.test(roomCodeInput.trim())) {
+      setJoinError('Please enter the 8-character room code');
       return;
     }
     localStorage.setItem('themind-player-name', playerName);
-    router.push(`/room/${roomCodeInput.toUpperCase()}?join=1`);
+    router.push(`/room/${roomCodeInput.toUpperCase()}`);
   };
 
   return (
@@ -134,7 +149,7 @@ function HomeInner() {
           transition={{ duration: 0.5, delay: 0.3 }}
           className="flex items-center justify-center gap-4 mb-10 text-xs text-gray-500"
         >
-          <span>2-8 Players</span>
+          <span>2-8 or 27-30 Players</span>
           <span className="w-1 h-1 rounded-full bg-gray-600" />
           <span>Real-time Online</span>
           <span className="w-1 h-1 rounded-full bg-gray-600" />
@@ -164,10 +179,16 @@ function HomeInner() {
           </div>
 
           <div className="space-y-3">
+            {!showJoinForm && joinError && <p className="text-sm text-red-400 text-center">{joinError}</p>}
             <AnimatePresence mode="wait">
               {!showJoinForm ? (
                 <motion.div key="create" initial={{ opacity: 0, x: -20 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: 20 }} transition={{ duration: 0.2 }} className="space-y-3">
-                  <button onClick={handleCreateRoom} className="w-full game-button-primary">Create Room</button>
+                  <button onClick={() => handleCreateRoom('standard')} disabled={creating !== null} className="w-full game-button-primary disabled:opacity-50">
+                    {creating === 'standard' ? 'Creating…' : 'Create Standard Room (2-8)'}
+                  </button>
+                  <button onClick={() => handleCreateRoom('large')} disabled={creating !== null} className="w-full game-button-secondary disabled:opacity-50">
+                    {creating === 'large' ? 'Creating…' : 'Create Large Group Room (27-30)'}
+                  </button>
                   <button onClick={() => setShowJoinForm(true)} className="w-full game-button-secondary">Join Room</button>
                 </motion.div>
               ) : (
@@ -175,9 +196,9 @@ function HomeInner() {
                   <div>
                     <label htmlFor="roomCode" className="block text-sm font-medium text-gray-300 mb-2 text-left">Room Code</label>
                     <input type="text" id="roomCode" value={roomCodeInput}
-                      onChange={(e) => { setRoomCodeInput(e.target.value.toUpperCase()); setJoinError(''); }}
+                      onChange={(e) => { setRoomCodeInput(e.target.value.toUpperCase().replace(/[^A-Z2-9]/g, '')); setJoinError(''); }}
                       onKeyDown={(e) => { if (e.key === 'Enter') handleJoinRoom(); }}
-                      placeholder="ABCD" maxLength={4}
+                      placeholder="ABCDEFGH" maxLength={8}
                       className="w-full px-4 py-3 bg-bg-primary/50 border border-white/10 rounded-lg text-white placeholder-gray-500 focus:outline-none focus:border-accent-star focus:ring-1 focus:ring-accent-star/30 transition-all text-center text-2xl font-bold tracking-widest uppercase"
                     />
                     {joinError && (
@@ -219,13 +240,13 @@ function HomeInner() {
         {showRules && (
           <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
             className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm"
-            onClick={() => setShowRules(false)}>
+            onClick={() => setShowRules(false)} role="dialog" aria-modal="true" aria-labelledby="rules-title">
             <motion.div initial={{ opacity: 0, scale: 0.9, y: 20 }} animate={{ opacity: 1, scale: 1, y: 0 }} exit={{ opacity: 0, scale: 0.9, y: 20 }}
               className="glass-card rounded-2xl p-6 max-w-lg mx-4 max-h-[min(80vh,_calc(100dvh_-_4rem))] overflow-y-auto"
               onClick={e => e.stopPropagation()}>
               <div className="flex justify-between items-center mb-4">
-                <h2 className="text-2xl font-bold text-white">How to Play</h2>
-                <button onClick={() => setShowRules(false)} className="text-gray-400 hover:text-white w-11 h-11 flex items-center justify-center text-xl rounded-lg touch-manipulation">&times;</button>
+                <h2 id="rules-title" className="text-2xl font-bold text-white">How to Play</h2>
+                <button autoFocus aria-label="Close rules" onClick={() => setShowRules(false)} className="text-gray-400 hover:text-white w-11 h-11 flex items-center justify-center text-xl rounded-lg touch-manipulation">&times;</button>
               </div>
               <div className="space-y-4 text-sm text-gray-300">
                 <div>
@@ -248,7 +269,7 @@ function HomeInner() {
                   <h3 className="text-accent-star font-semibold mb-1">Levels &amp; Rewards</h3>
                   <div className="grid grid-cols-2 gap-x-4 gap-y-1 mt-1 text-xs">
                     <p>2 players: 12 levels</p><p>3 players: 10 levels</p>
-                    <p>4 players: 8 levels</p><p>&nbsp;</p>
+                    <p>4 players: 8 levels</p><p>Large group: 3 levels</p>
                     <p className="col-span-2 mt-1 text-gray-400">Bonus rewards after completing:</p>
                     <p>Level 2: +1 star</p><p>Level 3: +1 life</p>
                     <p>Level 5: +1 star</p><p>Level 6: +1 life</p>

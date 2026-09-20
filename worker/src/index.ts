@@ -1,99 +1,56 @@
-import { DurableObject } from "cloudflare:workers";
+import { DurableObject } from 'cloudflare:workers';
+import { configFor, DECK_SIZE, dealCards, type GameConfig, type GameMode } from './game-rules';
 
-// ---------------------------------------------------------------------------
-// Shared game logic (same file used by Next.js client)
-// We inline the needed functions here since Wrangler bundles from worker/src/
-// and can't import from ../src/lib/game-logic.ts cleanly.
-// ---------------------------------------------------------------------------
-
-const LEVELS_BY_PLAYER_COUNT: Record<number, number> = {
-  2: 12, 3: 10, 4: 8, 5: 8, 6: 7, 7: 6, 8: 6,
-};
-const STARTING_LIVES: Record<number, number> = {
-  2: 2, 3: 3, 4: 4, 5: 4, 6: 4, 7: 5, 8: 5,
-};
-const STARTING_SHURIKENS: Record<number, number> = {
-  2: 1, 3: 1, 4: 1, 5: 2, 6: 2, 7: 3, 8: 3,
-};
-const BONUS_REWARDS: Record<number, { lives: number; shurikens: number }> = {
-  2: { lives: 0, shurikens: 1 },
-  3: { lives: 1, shurikens: 0 },
-  5: { lives: 0, shurikens: 1 },
-  6: { lives: 1, shurikens: 0 },
-  8: { lives: 0, shurikens: 1 },
-  9: { lives: 1, shurikens: 0 },
-};
+const ROOM_CODE_LENGTH = 8;
+const MAX_MESSAGE_BYTES = 2_048;
+const ACTION_WINDOW_MS = 10_000;
+const MAX_ACTIONS_PER_WINDOW = 30;
+const DISCONNECT_TIMEOUT = 30_000;
+const EMPTY_ROOM_CLEANUP = 60_000;
+const GAME_OVER_CLEANUP = 300_000;
+const IDLE_ROOM_CLEANUP = 3_600_000;
 const MAX_LIVES = 5;
 const MAX_SHURIKENS = 3;
 
-function shuffleDeck(): number[] {
-  const deck: number[] = [];
-  for (let i = 1; i <= 100; i++) deck.push(i);
-  for (let i = deck.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [deck[i], deck[j]] = [deck[j], deck[i]];
-  }
-  return deck;
-}
-
-function dealCards(playerIds: string[], cardsPerPlayer: number): Record<string, number[]> {
-  const deck = shuffleDeck();
-  const hands: Record<string, number[]> = {};
-  let idx = 0;
-  for (const pid of playerIds) {
-    const hand: number[] = [];
-    for (let j = 0; j < cardsPerPlayer; j++) {
-      if (idx < deck.length) hand.push(deck[idx++]);
-    }
-    hand.sort((a, b) => a - b);
-    hands[pid] = hand;
-  }
-  return hands;
-}
-
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
+type ActiveStatus = 'playing' | 'level_complete';
+type RoomStatus = 'waiting' | ActiveStatus | 'paused' | 'game_over' | 'victory';
 
 interface PlayerInfo {
   id: string;
   name: string;
+  /** Secret; never included in ClientState. */
+  resumeToken: string;
 }
 
 interface RoomState {
+  version: 2;
+  roomCode: string;
+  config: GameConfig;
   players: PlayerInfo[];
+  /** Immutable for a started game, even if a player later leaves. */
+  activePlayerIds: string[];
   level: number;
   lives: number;
   shurikens: number;
   playedCards: number[];
   discardedCards: number[];
   playerHands: Record<string, number[]>;
-  status: "waiting" | "playing" | "level_complete" | "game_over" | "victory";
+  status: RoomStatus;
+  pausedStatus: ActiveStatus | null;
   shurikenVotes: Record<string, boolean>;
+  /** Persisted deadline fields survive Durable Object hibernation. */
+  disconnectDeadlines: Record<string, number>;
+  levelAdvanceAt: number | null;
+  gameOverCleanupAt: number | null;
+  idleCleanupAt: number | null;
 }
-
-// Messages: client → server
-type ClientMsg =
-  | { type: "join"; name: string }
-  | { type: "start_game" }
-  | { type: "play_card"; card: number }
-  | { type: "vote_shuriken"; vote: boolean }
-  | { type: "restart_game" };
-
-// Messages: server → client (sent per-player, hand is player-specific)
-type ServerMsg =
-  | { type: "state"; state: ClientState }
-  | { type: "error"; message: string }
-  | { type: "card_played"; card: number; playerId: string }
-  | { type: "wrong_play"; card: number; lowerCards: number[]; livesLeft: number }
-  | { type: "level_complete"; level: number; bonusLives: number; bonusShurikens: number }
-  | { type: "game_over"; reason: "victory" | "no_lives" }
-  | { type: "shuriken_vote"; playerId: string; vote: boolean }
-  | { type: "shuriken_used"; discardedCards: Record<string, number> }
-  | { type: "player_left"; playerId: string; playerName: string };
 
 interface ClientState {
   roomCode: string;
+  mode: GameMode;
+  minPlayers: number;
+  maxPlayers: number;
+  maxLevels: number;
   players: { id: string; name: string; connected: boolean; cardCount: number }[];
   level: number;
   lives: number;
@@ -101,240 +58,310 @@ interface ClientState {
   playedCards: number[];
   discardedCards: number[];
   hand: number[];
-  status: RoomState["status"];
+  status: RoomStatus;
   shurikenVoteActive: boolean;
   shurikenVotes: Record<string, boolean>;
 }
 
-// ---------------------------------------------------------------------------
-// Env
-// ---------------------------------------------------------------------------
+type ClientMsg =
+  | { type: 'join'; name: string; resumeToken?: string }
+  | { type: 'start_game' }
+  | { type: 'play_card'; card: number }
+  | { type: 'vote_shuriken'; vote: boolean }
+  | { type: 'restart_game' }
+  | { type: 'leave_room' };
+
+type ServerMsg =
+  | { type: 'joined'; playerId: string; resumeToken: string }
+  | { type: 'state'; state: ClientState }
+  | { type: 'error'; message: string }
+  | { type: 'card_played'; card: number; playerId: string }
+  | { type: 'wrong_play'; card: number; lowerCards: number[]; livesLeft: number }
+  | { type: 'level_complete'; level: number; bonusLives: number; bonusShurikens: number }
+  | { type: 'game_over'; reason: 'victory' | 'no_lives' | 'player_left' }
+  | { type: 'shuriken_vote'; playerId: string; vote: boolean }
+  | { type: 'shuriken_used'; discardedCards: Record<string, number> }
+  | { type: 'player_left'; playerId: string; playerName: string };
+
+interface SocketAttachment {
+  playerId?: string;
+  actionWindowStartedAt?: number;
+  actionCount?: number;
+}
 
 export interface Env {
   GAME_ROOM: DurableObjectNamespace<GameRoom>;
-  /** Optional secret for the admin purge endpoint. Set via wrangler secret. */
   ADMIN_SECRET?: string;
+  /** Comma-separated production frontend origins. Leave unset only for local development. */
+  ALLOWED_ORIGINS?: string;
 }
 
-// ---------------------------------------------------------------------------
-// Durable Object: GameRoom
-// ---------------------------------------------------------------------------
-
-export class GameRoom extends DurableObject<Env> {
-  private state: RoomState = {
+function emptyRoomState(): RoomState {
+  return {
+    version: 2,
+    roomCode: '',
+    config: configFor('standard'),
     players: [],
+    activePlayerIds: [],
     level: 0,
     lives: 0,
     shurikens: 0,
     playedCards: [],
     discardedCards: [],
     playerHands: {},
-    status: "waiting",
+    status: 'waiting',
+    pausedStatus: null,
     shurikenVotes: {},
+    disconnectDeadlines: {},
+    levelAdvanceAt: null,
+    gameOverCleanupAt: null,
+    idleCleanupAt: null,
   };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function parseClientMessage(value: unknown): ClientMsg | null {
+  if (!isRecord(value) || typeof value.type !== 'string') return null;
+  switch (value.type) {
+    case 'join':
+      if (typeof value.name !== 'string') return null;
+      if (value.resumeToken !== undefined && typeof value.resumeToken !== 'string') return null;
+      return { type: 'join', name: value.name, resumeToken: value.resumeToken };
+    case 'start_game':
+    case 'restart_game':
+    case 'leave_room':
+      return { type: value.type };
+    case 'play_card':
+      return typeof value.card === 'number' && Number.isInteger(value.card)
+        ? { type: 'play_card', card: value.card }
+        : null;
+    case 'vote_shuriken':
+      return typeof value.vote === 'boolean' ? { type: 'vote_shuriken', vote: value.vote } : null;
+    default:
+      return null;
+  }
+}
+
+function normalizeName(name: string): string | null {
+  const normalized = name.trim().replace(/\s+/g, ' ');
+  return normalized.length >= 1 && normalized.length <= 24 ? normalized : null;
+}
+
+function createToken(): string {
+  return crypto.randomUUID();
+}
+
+export class GameRoom extends DurableObject<Env> {
+  private state = emptyRoomState();
   private initialized = false;
 
-  /** Maps playerId → timestamp when their disconnect timeout fires */
-  private disconnectTimers: Map<string, number> = new Map();
-
-  /** How long to wait before removing a disconnected player (ms) */
-  private static readonly DISCONNECT_TIMEOUT = 30_000;
-
-  /** How long to wait before cleaning up an empty room (ms) */
-  private static readonly EMPTY_ROOM_CLEANUP = 60_000;
-
-  /** How long after game over/victory before storage is cleaned up (ms) */
-  private static readonly GAME_OVER_CLEANUP = 300_000; // 5 minutes
-
-  /**
-   * How long a room can be completely idle (no connected WebSockets and no
-   * pending disconnect timers) before it is deleted automatically.  This is
-   * the safety net for rooms whose players all vanished without a clean WS
-   * close — e.g. iOS Safari backgrounding the tab or a network drop.
-   */
-  private static readonly IDLE_ROOM_CLEANUP = 3_600_000; // 1 hour
-
-  /** Timestamp when the finished-game cleanup alarm should fire, or null */
-  private gameOverCleanupAt: number | null = null;
-
-  constructor(ctx: DurableObjectState, env: Env) {
-    super(ctx, env);
-  }
-
-  // Restore state from storage on first access.
-  // Also self-heals stale rooms that were persisted before the idle-cleanup
-  // alarm logic existed — if storage has data but no alarm is set and no
-  // sockets are connected, we immediately schedule the idle-cleanup alarm so
-  // the room will eventually delete itself even if no one ever reconnects.
   private async ensureLoaded() {
     if (this.initialized) return;
     this.initialized = true;
-    const saved = await this.ctx.storage.get<RoomState>("room");
+    const saved = await this.ctx.storage.get<RoomState>('room');
     if (saved) {
-      this.state = saved;
-
-      // Self-heal: schedule idle cleanup for rooms with no active alarm
-      const existingAlarm = await this.ctx.storage.getAlarm();
-      if (existingAlarm === null) {
-        const hasConnectedSockets = this.ctx.getWebSockets().some(
-          ws => this.getPlayerId(ws) !== null
-        );
-        if (!hasConnectedSockets) {
-          // Room is loaded but abandoned — set a 1-hour idle cleanup alarm.
-          // This fires the next time the DO wakes (e.g. a new connection
-          // attempt, or automatically after deploy if Cloudflare activates it).
-          await this.ctx.storage.setAlarm(Date.now() + GameRoom.IDLE_ROOM_CLEANUP);
-        }
-      }
+      this.state = this.migrateState(saved);
     }
   }
 
-  // Persist state after every mutation
-  private async saveState() {
-    await this.ctx.storage.put("room", this.state);
+  /** Gives legacy persisted rooms safe defaults; new rooms are version 2. */
+  private migrateState(saved: RoomState): RoomState {
+    const legacy = saved as Partial<RoomState>;
+    const mode: GameMode = legacy.config?.mode === 'large' ? 'large' : 'standard';
+    const count = legacy.players?.length ?? 0;
+    const config = legacy.config ?? configFor(mode, count);
+    return {
+      ...emptyRoomState(),
+      ...legacy,
+      version: 2,
+      config,
+      players: (legacy.players ?? []).map(player => ({
+        ...player,
+        // Legacy sessions must rejoin once; names no longer authenticate them.
+        resumeToken: player.resumeToken ?? createToken(),
+      })),
+      activePlayerIds: legacy.activePlayerIds ?? [],
+      playerHands: legacy.playerHands ?? {},
+      shurikenVotes: legacy.shurikenVotes ?? {},
+      disconnectDeadlines: legacy.disconnectDeadlines ?? {},
+      pausedStatus: legacy.pausedStatus ?? null,
+      levelAdvanceAt: legacy.levelAdvanceAt ?? null,
+      gameOverCleanupAt: legacy.gameOverCleanupAt ?? null,
+      idleCleanupAt: legacy.idleCleanupAt ?? null,
+    };
   }
 
-  // ---- WebSocket lifecycle ------------------------------------------------
+  private async saveState() {
+    await this.ctx.storage.put('room', this.state);
+  }
 
   async fetch(request: Request): Promise<Response> {
     await this.ensureLoaded();
-
     const url = new URL(request.url);
 
-    // GET /room/:code/exists — returns whether this room has any players.
-    // Used by the client to validate a room code before joining.
-    if (request.method === "GET" && url.pathname.endsWith("/exists")) {
-      const exists = this.state.players.length > 0;
-      return new Response(JSON.stringify({ exists }), {
-        headers: { "Content-Type": "application/json" },
-      });
+    if (request.method === 'POST' && url.pathname.endsWith('/create')) {
+      if (this.state.roomCode) return new Response('Room already exists', { status: 409 });
+      const roomCode = url.pathname.split('/').at(-2)?.toUpperCase();
+      const mode = url.searchParams.get('mode');
+      if (!roomCode || !/^[A-Z2-9]{8}$/.test(roomCode) || (mode !== 'standard' && mode !== 'large')) {
+        return new Response('Invalid room', { status: 400 });
+      }
+      this.state = emptyRoomState();
+      this.state.roomCode = roomCode;
+      this.state.config = configFor(mode);
+      this.state.idleCleanupAt = Date.now() + IDLE_ROOM_CLEANUP;
+      await this.saveState();
+      await this.scheduleNextAlarm();
+      return Response.json({ roomCode, mode }, { status: 201 });
     }
 
-    // TEMP: DELETE /room/:code/purge — wipes storage on this specific DO instance.
-    if (request.method === "DELETE" && url.pathname.endsWith("/purge")) {
+    if (request.method === 'GET' && url.pathname.endsWith('/exists')) {
+      return Response.json({ exists: Boolean(this.state.roomCode) });
+    }
+
+    if (request.method === 'DELETE' && url.pathname.endsWith('/purge')) {
+      for (const ws of this.ctx.getWebSockets()) ws.close(1012, 'Room purged');
       await this.ctx.storage.deleteAll();
-      this.initialized = false;
-      return new Response(JSON.stringify({ purged: true }), {
-        headers: { "Content-Type": "application/json" },
-      });
+      this.state = emptyRoomState();
+      this.initialized = true;
+      return Response.json({ purged: true });
     }
 
-    // Accept WebSocket — the Upgrade header is always present on the
-    // Worker→DO internal hop when the browser initiated a WS connection.
+    if (!this.state.roomCode) return new Response('Room not found', { status: 404 });
+
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
-
     this.ctx.acceptWebSocket(server);
-
+    await this.scheduleNextAlarm();
     return new Response(null, { status: 101, webSocket: client });
   }
 
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer) {
     await this.ensureLoaded();
-    if (typeof message !== "string") return;
+    if (typeof message !== 'string' || message.length > MAX_MESSAGE_BYTES) {
+      this.send(ws, { type: 'error', message: 'Invalid message' });
+      return;
+    }
+    if (this.isRateLimited(ws)) {
+      this.send(ws, { type: 'error', message: 'Too many actions; slow down' });
+      return;
+    }
 
-    let msg: ClientMsg;
+    let parsed: unknown;
     try {
-      msg = JSON.parse(message);
+      parsed = JSON.parse(message);
     } catch {
-      ws.send(JSON.stringify({ type: "error", message: "Invalid JSON" }));
+      this.send(ws, { type: 'error', message: 'Invalid JSON' });
+      return;
+    }
+    const msg = parseClientMessage(parsed);
+    if (!msg) {
+      this.send(ws, { type: 'error', message: 'Invalid message' });
       return;
     }
 
     const playerId = this.getPlayerId(ws);
-
     switch (msg.type) {
-      case "join":
-        await this.handleJoin(ws, msg.name);
+      case 'join':
+        await this.handleJoin(ws, msg.name, msg.resumeToken);
         break;
-      case "start_game":
-        await this.handleStartGame(ws);
+      case 'start_game':
+        if (playerId) await this.handleStartGame(ws, playerId);
+        else this.send(ws, { type: 'error', message: 'Join the room first' });
         break;
-      case "play_card":
-        if (!playerId) return;
-        await this.handlePlayCard(playerId, msg.card);
+      case 'play_card':
+        if (playerId) await this.handlePlayCard(playerId, msg.card);
+        else this.send(ws, { type: 'error', message: 'Join the room first' });
         break;
-      case "vote_shuriken":
-        if (!playerId) return;
-        await this.handleShurikenVote(playerId, msg.vote);
+      case 'vote_shuriken':
+        if (playerId) await this.handleShurikenVote(playerId, msg.vote);
+        else this.send(ws, { type: 'error', message: 'Join the room first' });
         break;
-      case "restart_game":
-        await this.handleRestartGame();
+      case 'restart_game':
+        if (playerId) await this.handleRestartGame(ws, playerId);
+        else this.send(ws, { type: 'error', message: 'Join the room first' });
+        break;
+      case 'leave_room':
+        if (playerId) await this.removePlayer(playerId);
+        else this.send(ws, { type: 'error', message: 'Join the room first' });
         break;
     }
   }
 
   async webSocketClose(ws: WebSocket) {
+    await this.ensureLoaded();
     const playerId = this.getPlayerId(ws);
-    if (playerId) {
-      // Schedule removal after timeout
-      const removeAt = Date.now() + GameRoom.DISCONNECT_TIMEOUT;
-      this.disconnectTimers.set(playerId, removeAt);
-      await this.scheduleNextAlarm();
-
-      // Broadcast updated connection status immediately
-      this.broadcastState();
-    } else {
-      // Socket that never completed a join — schedule idle cleanup in case
-      // the room has no other connected players.
-      await this.scheduleNextAlarm();
+    if (playerId && this.state.players.some(player => player.id === playerId) && !this.isPlayerConnected(playerId)) {
+      this.state.disconnectDeadlines[playerId] = Date.now() + DISCONNECT_TIMEOUT;
+      if (this.state.activePlayerIds.includes(playerId) && this.isActiveGame()) {
+        this.state.pausedStatus = this.state.status as ActiveStatus;
+        this.state.status = 'paused';
+      }
     }
+    if (!this.hasConnectedPlayers()) this.state.idleCleanupAt = Date.now() + IDLE_ROOM_CLEANUP;
+    await this.saveState();
+    this.broadcastState();
+    await this.scheduleNextAlarm();
   }
 
-  // ---- Helpers ------------------------------------------------------------
+  private attachment(ws: WebSocket): SocketAttachment {
+    return (ws.deserializeAttachment() as SocketAttachment | null) ?? {};
+  }
 
   private getPlayerId(ws: WebSocket): string | null {
-    const att = ws.deserializeAttachment() as { playerId?: string } | null;
-    return att?.playerId ?? null;
+    return this.attachment(ws).playerId ?? null;
   }
 
-  private getPlayerWs(playerId: string): WebSocket | null {
-    for (const ws of this.ctx.getWebSockets()) {
-      if (this.getPlayerId(ws) === playerId) return ws;
+  private isRateLimited(ws: WebSocket): boolean {
+    const now = Date.now();
+    const attachment = this.attachment(ws);
+    if (!attachment.actionWindowStartedAt || now - attachment.actionWindowStartedAt >= ACTION_WINDOW_MS) {
+      attachment.actionWindowStartedAt = now;
+      attachment.actionCount = 1;
+    } else {
+      attachment.actionCount = (attachment.actionCount ?? 0) + 1;
     }
-    return null;
+    ws.serializeAttachment(attachment);
+    return attachment.actionCount > MAX_ACTIONS_PER_WINDOW;
   }
 
   private send(ws: WebSocket, msg: ServerMsg) {
     try {
       ws.send(JSON.stringify(msg));
     } catch {
-      // connection may be closed
+      // Closed sockets can race with a broadcast.
     }
   }
 
-  private broadcast(msg: ServerMsg, exclude?: string) {
+  private broadcast(msg: ServerMsg) {
     for (const ws of this.ctx.getWebSockets()) {
-      const pid = this.getPlayerId(ws);
-      if (pid && pid !== exclude) {
-        this.send(ws, msg);
-      }
+      if (this.getPlayerId(ws)) this.send(ws, msg);
     }
   }
 
   private broadcastState() {
     for (const ws of this.ctx.getWebSockets()) {
-      const pid = this.getPlayerId(ws);
-      if (pid) {
-        this.send(ws, { type: "state", state: this.buildClientState(pid) });
-      }
+      const playerId = this.getPlayerId(ws);
+      if (playerId) this.send(ws, { type: 'state', state: this.buildClientState(playerId) });
     }
   }
 
   private buildClientState(forPlayerId: string): ClientState {
-    const connectedIds = new Set<string>();
-    for (const ws of this.ctx.getWebSockets()) {
-      const pid = this.getPlayerId(ws);
-      if (pid) connectedIds.add(pid);
-    }
-
+    const config = this.state.config;
     return {
-      roomCode: this.ctx.id.toString().slice(-4).toUpperCase(),
-      players: this.state.players.map(p => ({
-        id: p.id,
-        name: p.name,
-        connected: connectedIds.has(p.id),
-        cardCount: this.state.playerHands[p.id]?.length ?? 0,
+      roomCode: this.state.roomCode,
+      mode: config.mode,
+      minPlayers: config.minPlayers,
+      maxPlayers: config.maxPlayers,
+      maxLevels: config.maxLevels,
+      players: this.state.players.map(player => ({
+        id: player.id,
+        name: player.name,
+        connected: this.isPlayerConnected(player.id),
+        cardCount: this.state.playerHands[player.id]?.length ?? 0,
       })),
       level: this.state.level,
       lives: this.state.lives,
@@ -348,430 +375,416 @@ export class GameRoom extends DurableObject<Env> {
     };
   }
 
-  // ---- Game actions -------------------------------------------------------
-
-  private async handleJoin(ws: WebSocket, name: string) {
-    // Generate player ID
-    const playerId = `p_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-    ws.serializeAttachment({ playerId });
-
-    // Check if this name already exists (reconnecting)
-    const existing = this.state.players.find(p => p.name === name);
-    if (existing) {
-      // Reconnect: reuse their player ID and cancel any pending removal
-      ws.serializeAttachment({ playerId: existing.id });
-      this.disconnectTimers.delete(existing.id);
-    } else {
-      this.state.players.push({ id: playerId, name });
-    }
-
-    await this.saveState();
-    this.broadcastState();
+  private isPlayerConnected(playerId: string): boolean {
+    return this.ctx.getWebSockets().some(ws => this.getPlayerId(ws) === playerId);
   }
 
-  private async handleStartGame(ws: WebSocket) {
-    const playerCount = this.state.players.length;
-    if (playerCount < 2 || playerCount > 8) {
-      this.send(ws, { type: "error", message: "Need 2-8 players" });
-      return;
-    }
-    if (this.state.status !== "waiting") {
-      this.send(ws, { type: "error", message: "Game already started" });
+  private hasConnectedPlayers(): boolean {
+    return this.ctx.getWebSockets().some(ws => this.getPlayerId(ws) !== null);
+  }
+
+  private allActivePlayersConnected(): boolean {
+    return this.state.activePlayerIds.every(playerId => this.isPlayerConnected(playerId));
+  }
+
+  private isActiveGame(): boolean {
+    return this.state.status === 'playing' || this.state.status === 'level_complete';
+  }
+
+  private markRoomActive() {
+    this.state.idleCleanupAt = null;
+  }
+
+  private async handleJoin(ws: WebSocket, nameInput: string, resumeToken?: string) {
+    const name = normalizeName(nameInput);
+    if (!name) {
+      this.send(ws, { type: 'error', message: 'Name must be 1–24 characters' });
       return;
     }
 
+    if (resumeToken) {
+      const existing = this.state.players.find(player => player.resumeToken === resumeToken);
+      if (!existing) {
+        this.send(ws, { type: 'error', message: 'Invalid or expired session' });
+        return;
+      }
+      ws.serializeAttachment({ ...this.attachment(ws), playerId: existing.id });
+      delete this.state.disconnectDeadlines[existing.id];
+      this.markRoomActive();
+      if (this.state.status === 'paused' && this.allActivePlayersConnected()) {
+        this.state.status = this.state.pausedStatus ?? 'playing';
+        this.state.pausedStatus = null;
+      }
+      await this.saveState();
+      this.send(ws, { type: 'joined', playerId: existing.id, resumeToken: existing.resumeToken });
+      this.broadcastState();
+      await this.scheduleNextAlarm();
+      return;
+    }
+
+    if (this.state.status !== 'waiting') {
+      this.send(ws, { type: 'error', message: 'The game has already started' });
+      return;
+    }
+    if (this.state.players.length >= this.state.config.maxPlayers) {
+      this.send(ws, { type: 'error', message: 'This room is full' });
+      return;
+    }
+    if (this.state.players.some(player => player.name.toLocaleLowerCase() === name.toLocaleLowerCase())) {
+      this.send(ws, { type: 'error', message: 'That name is already in use in this room' });
+      return;
+    }
+
+    const player: PlayerInfo = { id: crypto.randomUUID(), name, resumeToken: createToken() };
+    this.state.players.push(player);
+    ws.serializeAttachment({ ...this.attachment(ws), playerId: player.id });
+    delete this.state.disconnectDeadlines[player.id];
+    this.markRoomActive();
+    await this.saveState();
+    this.send(ws, { type: 'joined', playerId: player.id, resumeToken: player.resumeToken });
+    this.broadcastState();
+    await this.scheduleNextAlarm();
+  }
+
+  private async handleStartGame(ws: WebSocket, playerId: string) {
+    if (!this.state.players.some(player => player.id === playerId)) {
+      this.send(ws, { type: 'error', message: 'Invalid player session' });
+      return;
+    }
+    if (this.state.status !== 'waiting') {
+      this.send(ws, { type: 'error', message: 'Game already started' });
+      return;
+    }
+    const playerCount = this.state.players.length;
+    if (!this.state.players.every(player => this.isPlayerConnected(player.id))) {
+      this.send(ws, { type: 'error', message: 'Wait for all listed players to reconnect before starting' });
+      return;
+    }
+    const baseConfig = configFor(this.state.config.mode, playerCount);
+    if (playerCount < baseConfig.minPlayers || playerCount > baseConfig.maxPlayers) {
+      this.send(ws, { type: 'error', message: `Need ${baseConfig.minPlayers}–${baseConfig.maxPlayers} players` });
+      return;
+    }
+
+    this.state.config = baseConfig;
+    this.state.activePlayerIds = this.state.players.map(player => player.id);
     this.state.level = 1;
-    this.state.lives = STARTING_LIVES[playerCount];
-    this.state.shurikens = STARTING_SHURIKENS[playerCount];
+    this.state.lives = baseConfig.startingLives;
+    this.state.shurikens = baseConfig.startingShurikens;
     this.state.playedCards = [];
     this.state.discardedCards = [];
     this.state.shurikenVotes = {};
-    this.state.status = "playing";
-
-    const playerIds = this.state.players.map(p => p.id);
-    this.state.playerHands = dealCards(playerIds, 1);
+    this.state.status = 'playing';
+    this.state.pausedStatus = null;
+    this.state.playerHands = dealCards(this.state.activePlayerIds, 1);
 
     await this.saveState();
     this.broadcastState();
   }
 
-  private async handleRestartGame() {
+  private async handleRestartGame(ws: WebSocket, playerId: string) {
+    if (!this.state.players.some(player => player.id === playerId)) {
+      this.send(ws, { type: 'error', message: 'Invalid player session' });
+      return;
+    }
+    if (this.state.status !== 'game_over' && this.state.status !== 'victory') {
+      this.send(ws, { type: 'error', message: 'The current game cannot be restarted yet' });
+      return;
+    }
     this.state.level = 0;
     this.state.lives = 0;
     this.state.shurikens = 0;
     this.state.playedCards = [];
     this.state.discardedCards = [];
     this.state.playerHands = {};
+    this.state.activePlayerIds = [];
     this.state.shurikenVotes = {};
-    this.state.status = "waiting";
+    this.state.status = 'waiting';
+    this.state.pausedStatus = null;
+    this.state.levelAdvanceAt = null;
+    this.state.gameOverCleanupAt = null;
 
     await this.saveState();
     this.broadcastState();
+    await this.scheduleNextAlarm();
   }
 
   private async dealNextLevel() {
     const nextLevel = this.state.level + 1;
-    const playerIds = this.state.players.map(p => p.id);
-
     this.state.level = nextLevel;
     this.state.playedCards = [];
     this.state.discardedCards = [];
     this.state.shurikenVotes = {};
-    this.state.status = "playing";
-    this.state.playerHands = dealCards(playerIds, nextLevel);
-
+    this.state.status = 'playing';
+    this.state.pausedStatus = null;
+    this.state.levelAdvanceAt = null;
+    this.state.playerHands = dealCards(this.state.activePlayerIds, nextLevel);
     await this.saveState();
     this.broadcastState();
   }
 
   private async handlePlayCard(playerId: string, card: number) {
-    if (this.state.status !== "playing") return;
-
+    if (this.state.status !== 'playing' || !this.state.activePlayerIds.includes(playerId)) return;
+    if (card < 1 || card > DECK_SIZE) return;
     const hand = this.state.playerHands[playerId];
-    if (!hand || !hand.includes(card)) return;
+    if (!hand?.includes(card)) return;
 
-    // Check for lower cards in any player's hand
-    const lowerCards: number[] = [];
-    for (const pid in this.state.playerHands) {
-      for (const c of this.state.playerHands[pid]) {
-        if (c < card) lowerCards.push(c);
-      }
-    }
+    const lowerCards = Object.values(this.state.playerHands)
+      .flat()
+      .filter(otherCard => otherCard < card)
+      .sort((a, b) => a - b);
 
     if (lowerCards.length > 0) {
-      // Wrong play — lose a life
       this.state.lives--;
-
-      // Remove played card from player's hand
-      this.state.playerHands[playerId] = hand.filter(c => c !== card);
-      // Remove all lower cards from everyone's hands and add to discard pile
-      lowerCards.sort((a, b) => a - b);
+      this.state.playerHands[playerId] = hand.filter(handCard => handCard !== card);
       this.state.discardedCards.push(...lowerCards);
-      for (const pid in this.state.playerHands) {
-        this.state.playerHands[pid] = this.state.playerHands[pid].filter(
-          c => !lowerCards.includes(c)
-        );
+      const lowerSet = new Set(lowerCards);
+      for (const id of this.state.activePlayerIds) {
+        this.state.playerHands[id] = (this.state.playerHands[id] ?? []).filter(handCard => !lowerSet.has(handCard));
       }
       this.state.playedCards.push(card);
 
       if (this.state.lives <= 0) {
-        this.state.status = "game_over";
-        this.broadcast({ type: "game_over", reason: "no_lives" });
-        await this.saveState();
-        this.broadcastState();
-        await this.scheduleGameOverCleanup();
+        await this.finishGame('no_lives');
         return;
       }
-
-      this.broadcast({ type: "wrong_play", card, lowerCards, livesLeft: this.state.lives });
-
-      // Check if all cards are gone (wrong play can empty all hands)
+      this.broadcast({ type: 'wrong_play', card, lowerCards, livesLeft: this.state.lives });
       await this.checkLevelComplete();
       return;
     }
 
-    // Valid play
-    this.state.playerHands[playerId] = hand.filter(c => c !== card);
+    this.state.playerHands[playerId] = hand.filter(handCard => handCard !== card);
     this.state.playedCards.push(card);
-
-    // Broadcast the card landing
-    this.broadcast({ type: "card_played", card, playerId });
-
-    // Check if all cards are played
+    this.broadcast({ type: 'card_played', card, playerId });
     await this.checkLevelComplete();
   }
 
   private async checkLevelComplete() {
-    const allDone = Object.values(this.state.playerHands).every(h => h.length === 0);
-
-    if (allDone) {
-      const maxLevels = LEVELS_BY_PLAYER_COUNT[this.state.players.length] ?? 12;
-      const bonus = BONUS_REWARDS[this.state.level] ?? { lives: 0, shurikens: 0 };
-
-      this.state.lives = Math.min(this.state.lives + bonus.lives, MAX_LIVES);
-      this.state.shurikens = Math.min(this.state.shurikens + bonus.shurikens, MAX_SHURIKENS);
-
-      if (this.state.level >= maxLevels) {
-        this.state.status = "victory";
-        this.broadcast({ type: "game_over", reason: "victory" });
-        await this.saveState();
-        this.broadcastState();
-        await this.scheduleGameOverCleanup();
-      } else {
-        this.state.status = "level_complete";
-        this.broadcast({
-          type: "level_complete",
-          level: this.state.level,
-          bonusLives: bonus.lives,
-          bonusShurikens: bonus.shurikens,
-        });
-        await this.saveState();
-        this.broadcastState();
-
-        // Auto-deal next level after 3 seconds
-        await this.ctx.storage.setAlarm(Date.now() + 3000);
-      }
-    } else {
+    const allDone = this.state.activePlayerIds.every(playerId => (this.state.playerHands[playerId] ?? []).length === 0);
+    if (!allDone) {
       await this.saveState();
       this.broadcastState();
-    }
-  }
-
-  private async handleShurikenVote(playerId: string, vote: boolean) {
-    if (this.state.status !== "playing" || this.state.shurikens <= 0) return;
-
-    this.state.shurikenVotes[playerId] = vote;
-    this.broadcast({ type: "shuriken_vote", playerId, vote });
-
-    // Check if all connected players voted yes
-    const connectedIds = new Set<string>();
-    for (const ws of this.ctx.getWebSockets()) {
-      const pid = this.getPlayerId(ws);
-      if (pid) connectedIds.add(pid);
-    }
-
-    const allVotedYes = [...connectedIds].every(
-      pid => this.state.shurikenVotes[pid] === true
-    );
-
-    if (allVotedYes && connectedIds.size >= 2) {
-      // Use shuriken: discard lowest card from each player
-      this.state.shurikens--;
-      const discardedCards: Record<string, number> = {};
-
-      for (const pid in this.state.playerHands) {
-        const hand = this.state.playerHands[pid];
-        if (hand.length > 0) {
-          const lowest = Math.min(...hand);
-          discardedCards[pid] = lowest;
-          this.state.playerHands[pid] = hand.filter(c => c !== lowest);
-        }
-      }
-
-      this.state.shurikenVotes = {};
-      this.broadcast({ type: "shuriken_used", discardedCards });
-
-      // Shuriken discard could empty all hands
-      await this.checkLevelComplete();
       return;
     }
 
+    const bonus = this.state.config.bonusRewards[this.state.level] ?? { lives: 0, shurikens: 0 };
+    this.state.lives = Math.min(this.state.lives + bonus.lives, MAX_LIVES);
+    this.state.shurikens = Math.min(this.state.shurikens + bonus.shurikens, MAX_SHURIKENS);
+
+    if (this.state.level >= this.state.config.maxLevels) {
+      await this.finishGame('victory');
+      return;
+    }
+
+    this.state.status = 'level_complete';
+    this.state.levelAdvanceAt = Date.now() + 3_000;
+    this.broadcast({ type: 'level_complete', level: this.state.level, bonusLives: bonus.lives, bonusShurikens: bonus.shurikens });
     await this.saveState();
     this.broadcastState();
-  }
-
-  // ---- Alarm (handles both level deal and disconnect/cleanup timers) ------
-
-  /**
-   * Schedule the next alarm for the earliest pending event.
-   * Durable Objects only support one alarm at a time, so we pick the soonest.
-   */
-  private async scheduleNextAlarm() {
-    let earliest: number | null = null;
-
-    // Level auto-advance alarm
-    if (this.state.status === "level_complete") {
-      // The level-complete alarm is set directly in checkLevelComplete;
-      // we don't override it here — just find the soonest overall.
-    }
-
-    // Disconnect timers
-    for (const time of this.disconnectTimers.values()) {
-      if (earliest === null || time < earliest) earliest = time;
-    }
-
-    // Game-over cleanup timer
-    if (this.gameOverCleanupAt !== null) {
-      if (earliest === null || this.gameOverCleanupAt < earliest) {
-        earliest = this.gameOverCleanupAt;
-      }
-    }
-
-    // Idle room cleanup: if no sockets are connected and no disconnect timers
-    // are pending, schedule a safety-net deletion to reclaim resources.
-    const hasConnectedSockets = this.ctx.getWebSockets().some(
-      ws => this.getPlayerId(ws) !== null
-    );
-    if (!hasConnectedSockets && this.disconnectTimers.size === 0 && this.state.players.length > 0) {
-      const idleCleanupAt = Date.now() + GameRoom.IDLE_ROOM_CLEANUP;
-      if (earliest === null || idleCleanupAt < earliest) earliest = idleCleanupAt;
-    }
-
-    if (earliest !== null) {
-      // Only set if it's sooner than any existing alarm
-      const current = await this.ctx.storage.getAlarm();
-      if (current === null || earliest < current) {
-        await this.ctx.storage.setAlarm(earliest);
-      }
-    }
-  }
-
-  /** Schedule storage cleanup 5 minutes after game over/victory */
-  private async scheduleGameOverCleanup() {
-    this.gameOverCleanupAt = Date.now() + GameRoom.GAME_OVER_CLEANUP;
     await this.scheduleNextAlarm();
   }
 
-  /**
-   * Remove a player from the room. In the lobby, just delete them.
-   * Mid-game, discard their hand and check for level completion / game over.
-   */
-  private async removePlayer(playerId: string) {
-    const player = this.state.players.find(p => p.id === playerId);
-    if (!player) return;
+  private async handleShurikenVote(playerId: string, vote: boolean) {
+    if (this.state.status !== 'playing' || this.state.shurikens <= 0 || !this.state.activePlayerIds.includes(playerId)) return;
+    this.state.shurikenVotes[playerId] = vote;
+    this.broadcast({ type: 'shuriken_vote', playerId, vote });
 
-    const playerName = player.name;
-
-    // Remove from player list
-    this.state.players = this.state.players.filter(p => p.id !== playerId);
-
-    // Clean up their game state
-    const discardedHand = this.state.playerHands[playerId] ?? [];
-    if (discardedHand.length > 0) {
-      this.state.discardedCards.push(...discardedHand);
-    }
-    delete this.state.playerHands[playerId];
-    delete this.state.shurikenVotes[playerId];
-
-    // Notify remaining players
-    this.broadcast({ type: "player_left", playerId, playerName });
-
-    // If no players left, clean up the room entirely
-    if (this.state.players.length === 0) {
-      await this.ctx.storage.deleteAll();
-      this.initialized = false;
-      return;
-    }
-
-    // If mid-game and only 1 player remains, end the game
-    if (this.state.status === "playing" && this.state.players.length < 2) {
-      this.state.status = "game_over";
-      this.broadcast({ type: "game_over", reason: "no_lives" });
+    const allVotedYes = this.state.activePlayerIds.every(id => this.state.shurikenVotes[id] === true);
+    if (!allVotedYes) {
       await this.saveState();
       this.broadcastState();
-      await this.scheduleGameOverCleanup();
       return;
     }
 
-    // If mid-game, discarding this player's hand may complete the level
-    if (this.state.status === "playing") {
-      await this.checkLevelComplete();
+    this.state.shurikens--;
+    const discardedCards: Record<string, number> = {};
+    for (const id of this.state.activePlayerIds) {
+      const hand = this.state.playerHands[id] ?? [];
+      if (hand.length) {
+        const lowest = hand[0];
+        discardedCards[id] = lowest;
+        this.state.playerHands[id] = hand.slice(1);
+      }
+    }
+    this.state.shurikenVotes = {};
+    this.broadcast({ type: 'shuriken_used', discardedCards });
+    await this.checkLevelComplete();
+  }
+
+  private async finishGame(reason: 'victory' | 'no_lives' | 'player_left') {
+    this.state.status = reason === 'victory' ? 'victory' : 'game_over';
+    this.state.pausedStatus = null;
+    this.state.levelAdvanceAt = null;
+    this.state.gameOverCleanupAt = Date.now() + GAME_OVER_CLEANUP;
+    this.broadcast({ type: 'game_over', reason });
+    await this.saveState();
+    this.broadcastState();
+    await this.scheduleNextAlarm();
+  }
+
+  private async removePlayer(playerId: string) {
+    const player = this.state.players.find(candidate => candidate.id === playerId);
+    if (!player) return;
+    const wasActivePlayer = this.state.activePlayerIds.includes(playerId);
+    const discardedHand = this.state.playerHands[playerId] ?? [];
+    delete this.state.disconnectDeadlines[playerId];
+    this.state.players = this.state.players.filter(candidate => candidate.id !== playerId);
+    this.state.activePlayerIds = this.state.activePlayerIds.filter(id => id !== playerId);
+    delete this.state.playerHands[playerId];
+    delete this.state.shurikenVotes[playerId];
+    this.state.discardedCards.push(...discardedHand);
+    this.broadcast({ type: 'player_left', playerId, playerName: player.name });
+
+    if (this.state.players.length === 0) {
+      await this.ctx.storage.deleteAll();
+      this.state = emptyRoomState();
       return;
     }
 
+    // Leaving is a forfeit: discard that hand and continue with the remaining
+    // roster. The configured level progression stays fixed at game start.
+    if (wasActivePlayer && !['game_over', 'victory'].includes(this.state.status)) {
+      if (this.state.activePlayerIds.length < 2) {
+        await this.finishGame('player_left');
+        return;
+      }
+      if (this.state.status === 'paused' && this.allActivePlayersConnected()) {
+        this.state.status = this.state.pausedStatus ?? 'playing';
+        this.state.pausedStatus = null;
+      }
+      if (this.state.status === 'playing') {
+        await this.checkLevelComplete();
+        return;
+      }
+    }
     await this.saveState();
     this.broadcastState();
   }
 
-  async alarm() {    await this.ensureLoaded();
+  private async scheduleNextAlarm() {
+    const deadlines = [
+      ...Object.values(this.state.disconnectDeadlines),
+      this.state.levelAdvanceAt,
+      this.state.gameOverCleanupAt,
+      this.state.idleCleanupAt,
+    ].filter((value): value is number => value !== null && value !== undefined);
+    if (!deadlines.length) return;
+    const next = Math.min(...deadlines);
+    const current = await this.ctx.storage.getAlarm();
+    if (current === null || next < current || current < Date.now()) await this.ctx.storage.setAlarm(next);
+  }
+
+  async alarm() {
+    await this.ensureLoaded();
     const now = Date.now();
 
-    // Process disconnect timers
-    const expired: string[] = [];
-    for (const [playerId, time] of this.disconnectTimers) {
-      if (time <= now) expired.push(playerId);
-    }
-    for (const playerId of expired) {
-      this.disconnectTimers.delete(playerId);
-      // Only remove if they're still disconnected (no active WebSocket)
-      const stillConnected = this.ctx.getWebSockets().some(
-        ws => this.getPlayerId(ws) === playerId
-      );
-      if (!stillConnected) {
-        await this.removePlayer(playerId);
-      }
+    for (const [playerId, deadline] of Object.entries(this.state.disconnectDeadlines)) {
+      if (deadline <= now && !this.isPlayerConnected(playerId)) await this.removePlayer(playerId);
+      else if (this.isPlayerConnected(playerId)) delete this.state.disconnectDeadlines[playerId];
     }
 
-    // Handle level auto-advance
-    if (this.state.status === "level_complete") {
+    if (this.state.gameOverCleanupAt !== null && now >= this.state.gameOverCleanupAt && (this.state.status === 'game_over' || this.state.status === 'victory')) {
+      await this.ctx.storage.deleteAll();
+      this.state = emptyRoomState();
+      return;
+    }
+
+    if (this.state.idleCleanupAt !== null && now >= this.state.idleCleanupAt && !this.hasConnectedPlayers()) {
+      await this.ctx.storage.deleteAll();
+      this.state = emptyRoomState();
+      return;
+    }
+
+    if (this.state.levelAdvanceAt !== null && now >= this.state.levelAdvanceAt && this.state.status === 'level_complete') {
       await this.dealNextLevel();
-    }
-
-    // Handle game-over storage cleanup
-    if (
-      this.gameOverCleanupAt !== null &&
-      now >= this.gameOverCleanupAt &&
-      (this.state.status === "game_over" || this.state.status === "victory")
-    ) {
-      this.gameOverCleanupAt = null;
-      await this.ctx.storage.deleteAll();
-      this.initialized = false;
       return;
     }
 
-    // Idle room cleanup: delete abandoned rooms that have had no connected
-    // sockets for the full IDLE_ROOM_CLEANUP window.  This fires when the
-    // alarm set by scheduleNextAlarm() matures without anyone reconnecting.
-    const hasConnectedSockets = this.ctx.getWebSockets().some(
-      ws => this.getPlayerId(ws) !== null
-    );
-    if (!hasConnectedSockets && this.disconnectTimers.size === 0 && this.state.players.length > 0) {
-      await this.ctx.storage.deleteAll();
-      this.initialized = false;
-      return;
-    }
-
-    // If there are remaining timers, schedule the next alarm
+    await this.saveState();
     await this.scheduleNextAlarm();
   }
 }
 
-// ---------------------------------------------------------------------------
-// Worker: routes WebSocket connections to the correct Durable Object
-// ---------------------------------------------------------------------------
+function allowedOrigin(request: Request, env: Env): string | null {
+  const origin = request.headers.get('Origin');
+  const configured = env.ALLOWED_ORIGINS?.split(',').map(value => value.trim()).filter(Boolean) ?? [];
+  if (!configured.length) return origin ?? '*';
+  return origin && configured.includes(origin) ? origin : null;
+}
+
+function corsHeaders(origin: string): HeadersInit {
+  return {
+    'Access-Control-Allow-Origin': origin,
+    'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, Upgrade, X-Admin-Secret',
+    'Vary': 'Origin',
+  };
+}
+
+function randomRoomCode(): string {
+  // 32 symbols means every byte maps uniformly via its low five bits.
+  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  const bytes = crypto.getRandomValues(new Uint8Array(ROOM_CODE_LENGTH));
+  return Array.from(bytes, byte => alphabet[byte & 31]).join('');
+}
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
+    const origin = allowedOrigin(request, env);
+    if (request.method === 'OPTIONS') {
+      return origin ? new Response(null, { headers: corsHeaders(origin) }) : new Response('Forbidden', { status: 403 });
+    }
+    // A browser always supplies Origin for cross-origin fetches/WebSockets.
+    // Permit non-browser administrative requests with no Origin header.
+    if (request.headers.get('Origin') && !origin) return new Response('Forbidden', { status: 403 });
 
-    // CORS headers for the Next.js frontend
-    const corsHeaders = {
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Upgrade, X-Admin-Secret",
-    };
+    const respond = (body: BodyInit | null, init: ResponseInit = {}) =>
+      new Response(body, { ...init, headers: { ...corsHeaders(origin ?? '*'), ...(init.headers ?? {}) } });
 
-    if (request.method === "OPTIONS") {
-      return new Response(null, { headers: corsHeaders });
+    if (request.method === 'POST' && url.pathname === '/rooms') {
+      if (!origin) return new Response('Forbidden', { status: 403 });
+      let mode: GameMode = 'standard';
+      try {
+        const body = await request.json() as { mode?: unknown };
+        if (body.mode === 'large') mode = 'large';
+        else if (body.mode !== undefined && body.mode !== 'standard') return respond('Invalid mode', { status: 400 });
+      } catch {
+        return respond('Invalid JSON', { status: 400 });
+      }
+      for (let attempt = 0; attempt < 5; attempt++) {
+        const roomCode = randomRoomCode();
+        const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(roomCode));
+        const created = await stub.fetch(new Request(`${url.origin}/room/${roomCode}/create?mode=${mode}`, { method: 'POST' }));
+        if (created.status === 201) return respond(JSON.stringify({ roomCode, mode }), { status: 201, headers: { 'Content-Type': 'application/json' } });
+      }
+      return respond('Could not create room', { status: 503 });
     }
 
-    // Admin: DELETE /admin/purge/:code — forcibly delete a stale room's storage.
-    // Requires the X-Admin-Secret header to match the ADMIN_SECRET binding.
-    // Example: curl -X DELETE https://worker.example.com/admin/purge/ABCD \
-    //               -H "X-Admin-Secret: your-secret"
-    const purgeMatch = url.pathname.match(/^\/admin\/purge\/([A-Z0-9]{4})$/i);
-    if (purgeMatch && request.method === "DELETE") {
-      const providedSecret = request.headers.get("X-Admin-Secret");
-      if (!env.ADMIN_SECRET || providedSecret !== env.ADMIN_SECRET) {
-        return new Response("Unauthorized", { status: 401, headers: corsHeaders });
+    const purgeMatch = url.pathname.match(/^\/admin\/purge\/([A-Z2-9]{8})$/i);
+    if (purgeMatch && request.method === 'DELETE') {
+      if (!env.ADMIN_SECRET || request.headers.get('X-Admin-Secret') !== env.ADMIN_SECRET) {
+        return respond('Unauthorized', { status: 401 });
       }
       const roomCode = purgeMatch[1].toUpperCase();
-      const id = env.GAME_ROOM.idFromName(roomCode);
-      const stub = env.GAME_ROOM.get(id);
-      return stub.fetch(
-        new Request(`${url.origin}/room/${roomCode}/purge`, { method: "DELETE" }),
-      );
+      const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(roomCode));
+      const result = await stub.fetch(new Request(`${url.origin}/room/${roomCode}/purge`, { method: 'DELETE' }));
+      return respond(await result.text(), { status: result.status, headers: { 'Content-Type': 'application/json' } });
     }
 
-    // Route: /room/:code — proxy to Durable Object by room code
-    const match = url.pathname.match(/^\/room\/([A-Z0-9]{4})$/i);
-    if (match) {
-      const roomCode = match[1].toUpperCase();
-      const id = env.GAME_ROOM.idFromName(roomCode);
-      const stub = env.GAME_ROOM.get(id);
+    const match = url.pathname.match(/^\/room\/([A-Z2-9]{8})$/i);
+    if (!match) return respond('Not found', { status: 404 });
+    const roomCode = match[1].toUpperCase();
+    const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(roomCode));
+    const upgrade = request.headers.get('Upgrade')?.toLowerCase();
 
-      // GET /room/:code — check if room exists (no WS upgrade)
-      const upgradeHeader = request.headers.get("Upgrade");
-      if (!upgradeHeader || upgradeHeader !== "websocket") {
-        return stub.fetch(
-          new Request(`${url.origin}/room/${roomCode}/exists`, { method: "GET" })
-        );
-      }
-
-      // WebSocket upgrade — connect to the room
-      return stub.fetch(request);
+    if (request.method === 'GET' && upgrade !== 'websocket') {
+      const result = await stub.fetch(new Request(`${url.origin}/room/${roomCode}/exists`, { method: 'GET' }));
+      return respond(await result.text(), { status: result.status, headers: { 'Content-Type': 'application/json' } });
     }
-
-    return new Response("Not found", { status: 404, headers: corsHeaders });
+    if (request.method !== 'GET') return respond('Method not allowed', { status: 405 });
+    if (upgrade !== 'websocket') return respond('Expected WebSocket upgrade', { status: 426 });
+    if (!origin) return new Response('Forbidden', { status: 403 });
+    return stub.fetch(request);
   },
 } satisfies ExportedHandler<Env>;
