@@ -149,7 +149,7 @@ function HomeInner() {
           transition={{ duration: 0.5, delay: 0.3 }}
           className="flex items-center justify-center gap-4 mb-10 text-xs text-gray-500"
         >
-          <span>2-8 or 27-30 Players</span>
+          <span>2-8 Standard or 2-30 Large</span>
           <span className="w-1 h-1 rounded-full bg-gray-600" />
           <span>Real-time Online</span>
           <span className="w-1 h-1 rounded-full bg-gray-600" />
@@ -187,7 +187,7 @@ function HomeInner() {
                     {creating === 'standard' ? 'Creating…' : 'Create Standard Room (2-8)'}
                   </button>
                   <button onClick={() => handleCreateRoom('large')} disabled={creating !== null} className="w-full game-button-secondary disabled:opacity-50">
-                    {creating === 'large' ? 'Creating…' : 'Create Large Group Room (27-30)'}
+                    {creating === 'large' ? 'Creating…' : 'Create Large Group Room (2-30)'}
                   </button>
                   <button onClick={() => setShowJoinForm(true)} className="w-full game-button-secondary">Join Room</button>
                 </motion.div>

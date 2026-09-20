@@ -6,7 +6,7 @@ test('large-group mode is constrained by the 100-card deck', () => {
   const config = configFor('large');
   assert.deepEqual(
     { min: config.minPlayers, max: config.maxPlayers, levels: config.maxLevels },
-    { min: 27, max: 30, levels: 3 },
+    { min: 2, max: 30, levels: 3 },
   );
   assert.ok(config.maxPlayers * config.maxLevels <= DECK_SIZE);
   assert.ok(config.maxPlayers * (config.maxLevels + 1) > DECK_SIZE);

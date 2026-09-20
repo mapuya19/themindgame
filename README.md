@@ -86,7 +86,7 @@ npm run deploy:worker    # Deploy the Cloudflare Worker
 ## How the Game Works
 
 1. A player creates a room and shares the server-generated 8-character code.
-2. 2-8 players join Standard mode, or 27-30 players join Large Group mode.
+2. 2-8 players join Standard mode, or 2-30 players join Large Group mode.
 3. Each round, players are dealt cards (round 1 = 1 card, round 2 = 2, etc.).
 4. Players must play their cards in ascending order across all hands -- without talking.
 5. Playing a card out of order costs a life. The team shares a pool of lives.
@@ -96,7 +96,7 @@ npm run deploy:worker    # Deploy the Cloudflare Worker
 ### Modes
 
 - **Standard:** 2-8 players, with the original progression adapted for this app.
-- **Large Group:** 27-30 players and exactly three levels. A 100-card deck can deal at most three cards to each of 30 players (90 cards); level four would require more than 100 cards.
+- **Large Group:** 2-30 players and exactly three levels. This lets a group of any size use the short-format rules; at 30 players, a fourth level would require more than the 100-card deck.
 
 The roster locks at game start. A temporary disconnect pauses the game for up to 30 seconds and can be resumed with the player session stored in that browser. An explicit leave (or an expired disconnect) forfeits that player's hand and the remaining players continue with the already selected level progression.
 

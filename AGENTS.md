@@ -47,7 +47,7 @@ The server sends a full `state` message after every mutation. Event messages (`c
 - Deck is cards 1-100, shuffled each level.
 - Cards per player equals the current level number (level 1 = 1 card, level 5 = 5 cards).
 - Standard mode supports 2-8 players (2 players = 12 levels; 8 players = 6 levels).
-- Large Group mode supports 27-30 players and has three levels; a fourth cannot fit in a 100-card deck.
+- Large Group mode supports 2-30 players and has three levels; at 30 players, a fourth cannot fit in a 100-card deck.
 - Playing a card when lower cards exist in any hand is a wrong play -- costs 1 life, and all lower cards are discarded.
 - Bonus lives/shurikens are awarded at specific level milestones (levels 2, 3, 5, 6, 8, 9).
 - Shuriken requires unanimous vote; each player's lowest card is discarded.

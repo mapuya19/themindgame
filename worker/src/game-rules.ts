@@ -34,7 +34,8 @@ export function configFor(mode: GameMode, playerCount?: number): GameConfig {
   if (mode === 'large') {
     return {
       mode,
-      minPlayers: 27,
+      // Large mode may be used by any group above the standard-mode cap too.
+      minPlayers: 2,
       maxPlayers: 30,
       // 30 × 3 = 90 cards; a fourth level cannot fit in a 1–100 deck.
       maxLevels: 3,

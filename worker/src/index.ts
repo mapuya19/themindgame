@@ -172,7 +172,11 @@ export class GameRoom extends DurableObject<Env> {
     const legacy = saved as Partial<RoomState>;
     const mode: GameMode = legacy.config?.mode === 'large' ? 'large' : 'standard';
     const count = legacy.players?.length ?? 0;
-    const config = legacy.config ?? configFor(mode, count);
+    // Apply the current large-mode policy to persisted lobbies too, so rooms
+    // created before the minimum was relaxed can start with their current group.
+    const config = legacy.config?.mode === 'large'
+      ? configFor('large')
+      : legacy.config ?? configFor(mode, count);
     return {
       ...emptyRoomState(),
       ...legacy,
