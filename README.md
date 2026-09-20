@@ -98,7 +98,7 @@ npm run deploy:worker    # Deploy the Cloudflare Worker
 - **Standard:** 2-8 players, with the original progression adapted for this app.
 - **Large Group:** 2-30 players and exactly three levels. This lets a group of any size use the short-format rules; at 30 players, a fourth level would require more than the 100-card deck.
 
-The roster locks at game start. A temporary disconnect pauses the game for up to 30 seconds and can be resumed with the player session stored in that browser. An explicit leave (or an expired disconnect) forfeits that player's hand and the remaining players continue with the already selected level progression.
+The roster locks at game start. A temporary disconnect pauses the game for five seconds so a tab refresh can recover. Any remaining player can immediately choose **Continue Without Them**, or the absent hand is automatically forfeited when that grace period expires; the remaining players continue with the already selected level progression.
 
 ## License
 

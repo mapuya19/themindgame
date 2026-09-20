@@ -41,7 +41,8 @@ export type ClientMessage =
   | { type: 'play_card'; card: number }
   | { type: 'vote_shuriken'; vote: boolean }
   | { type: 'restart_game' }
-  | { type: 'leave_room' };
+  | { type: 'leave_room' }
+  | { type: 'continue_without_disconnected' };
 
 export type ServerMessage =
   | { type: 'joined'; playerId: string; resumeToken: string }

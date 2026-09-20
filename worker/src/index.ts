@@ -5,7 +5,8 @@ const ROOM_CODE_LENGTH = 8;
 const MAX_MESSAGE_BYTES = 2_048;
 const ACTION_WINDOW_MS = 10_000;
 const MAX_ACTIONS_PER_WINDOW = 30;
-const DISCONNECT_TIMEOUT = 30_000;
+// Briefly pause for a tab refresh, then forfeit the absent hand and continue.
+const DISCONNECT_TIMEOUT = 5_000;
 const EMPTY_ROOM_CLEANUP = 60_000;
 const GAME_OVER_CLEANUP = 300_000;
 const IDLE_ROOM_CLEANUP = 3_600_000;
@@ -69,7 +70,8 @@ type ClientMsg =
   | { type: 'play_card'; card: number }
   | { type: 'vote_shuriken'; vote: boolean }
   | { type: 'restart_game' }
-  | { type: 'leave_room' };
+  | { type: 'leave_room' }
+  | { type: 'continue_without_disconnected' };
 
 type ServerMsg =
   | { type: 'joined'; playerId: string; resumeToken: string }
@@ -133,6 +135,7 @@ function parseClientMessage(value: unknown): ClientMsg | null {
     case 'start_game':
     case 'restart_game':
     case 'leave_room':
+    case 'continue_without_disconnected':
       return { type: value.type };
     case 'play_card':
       return typeof value.card === 'number' && Number.isInteger(value.card)
@@ -290,6 +293,10 @@ export class GameRoom extends DurableObject<Env> {
         break;
       case 'leave_room':
         if (playerId) await this.removePlayer(playerId);
+        else this.send(ws, { type: 'error', message: 'Join the room first' });
+        break;
+      case 'continue_without_disconnected':
+        if (playerId) await this.continueWithoutDisconnected(ws, playerId);
         else this.send(ws, { type: 'error', message: 'Join the room first' });
         break;
     }
@@ -624,6 +631,21 @@ export class GameRoom extends DurableObject<Env> {
     await this.saveState();
     this.broadcastState();
     await this.scheduleNextAlarm();
+  }
+
+  private async continueWithoutDisconnected(ws: WebSocket, playerId: string) {
+    if (!this.state.activePlayerIds.includes(playerId) || this.state.status !== 'paused') {
+      this.send(ws, { type: 'error', message: 'There is no paused game to continue' });
+      return;
+    }
+    const missingPlayerIds = this.state.activePlayerIds.filter(id => !this.isPlayerConnected(id));
+    if (!missingPlayerIds.length) {
+      this.send(ws, { type: 'error', message: 'Everyone is already connected' });
+      return;
+    }
+    for (const missingPlayerId of missingPlayerIds) {
+      await this.removePlayer(missingPlayerId);
+    }
   }
 
   private async removePlayer(playerId: string) {

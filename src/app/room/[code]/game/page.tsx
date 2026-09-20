@@ -108,6 +108,10 @@ export default function GamePage() {
     clientRef.current?.send({ type: 'vote_shuriken', vote });
   };
 
+  const handleContinueWithoutDisconnected = () => {
+    clientRef.current?.send({ type: 'continue_without_disconnected' });
+  };
+
   const handleLeaveRoom = () => {
     clientRef.current?.send({ type: 'leave_room' });
     clientRef.current?.disconnect();
@@ -153,7 +157,10 @@ export default function GamePage() {
             className="fixed inset-0 z-40 flex items-center justify-center bg-black/70 backdrop-blur-sm" role="alert" aria-live="assertive">
             <div className="glass-card rounded-2xl p-8 text-center max-w-md mx-4">
               <h2 className="text-3xl font-bold text-accent-star mb-2">Game Paused</h2>
-              <p className="text-gray-300">Waiting for a disconnected player to return.</p>
+              <p className="text-gray-300 mb-5">A disconnected player&apos;s hand will be forfeited in a few seconds.</p>
+              <button onClick={handleContinueWithoutDisconnected} className="game-button-primary w-full">
+                Continue Without Them
+              </button>
             </div>
           </motion.div>
         )}
